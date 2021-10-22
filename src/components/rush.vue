@@ -1,27 +1,25 @@
 <template>
-  <div class="hilo" ref="hilo">
-    <div class="hilo-info">
-      <div class="hilo-score">得分 {{ score }}</div>
-      <div class="hilo-time">时间 {{ gameTime }}s</div>
+  <div class="rush" ref="rush">
+    <div class="rush-info">
+      <div class="rush-score">得分 {{ score }}</div>
+      <div class="rush-time">时间 {{ gameTime }}s</div>
     </div>
     <van-popup v-model:show="show">您本次游戏：{{ score }}分</van-popup>
   </div>
 </template>
 
 <script>
-// import Hilo from "hilojs";\
-import Game from "../lib/game";
+import Game from "../lib/rush/index";
 export default {
   name: "",
   data() {
     return {
-      game: new Game(),
+      game: new Game({}, 'test'),
       show: false,
     };
   },
   watch: {
     gameTime(val) {
-      console.log('val???');
       if (val == 0) {
         //游戏结束
         setTimeout(() => {
@@ -40,13 +38,13 @@ export default {
   },
   methods: {},
   mounted() {
-    this.game.page = this.$refs.hilo;
+    this.game.page = this.$refs.fush;
     this.game.init();
   },
 };
 </script>
 <style lang="scss">
-.hilo {
+.rush {
   position: relative;
 
   &-info {
