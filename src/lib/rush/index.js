@@ -1,14 +1,20 @@
 import Phaser from "phaser";
+import gameScene from "./game-scene";
 
 class Game {
   constructor(config = {}) {
-    let _this = this;
     // 游戏界面缩放设置：最大宽度为设计图的宽，高度按缩放zoom来算，不超过窗口高度，不大于设计图高度
     this.desWidth = 640;
     this.desHeight = 1600;
-    this.zoom = window.innerWidth / this.desWidth > 1 ? 1 : window.innerWidth / this.desWidth;
+    this.zoom =
+      window.innerWidth / this.desWidth > 1
+        ? 1
+        : window.innerWidth / this.desWidth;
     this.gameWidth = this.desWidth;
-    this.gameHeight = (window.innerHeight >  this.desHeight ? this.desHeight : window.innerHeight) / this.zoom;
+    this.gameHeight =
+      (window.innerHeight > this.desHeight
+        ? this.desHeight
+        : window.innerHeight) / this.zoom;
 
     this.game = null;
     this.platforms = null;
@@ -16,66 +22,116 @@ class Game {
     this.cursors = null;
     this.stars = null;
     this.score = 0;
-    this.scoreText = '';
+    this.scoreText = "";
 
     this.options = {
-      baseURL: location.protocol + '//' + location.host,
+      baseURL: location.protocol + "//" + location.host,
       config: {
-        backgroundColor: '0xffffff',
+        pixelArt: true,
+        backgroundColor: "0xffffff",
         type: Phaser.AUTO,
         width: this.gameWidth,
         height: this.gameHeight,
         zoom: this.zoom,
-        physics: {
-          default: 'arcade',
-          arcade: {
-            gravity: { y: 300 },
-            debug: false
-          }
-        },
-        scene: {
-          preload () {
-            _this.preload.bind(this, _this)(); 
-          },
-          create () {
-            _this.create.bind(this, _this)(); 
-          },
-          update () {
-            _this.update.bind(this, _this)(); 
-          }
-        }
+        // physics: {
+        //   default: "arcade",
+        //   arcade: {
+        //     gravity: { y: 300 },
+        //     debug: false,
+        //   },
+        // },
+        scene: gameScene(this),
       },
-      assets: [ // 1: 普通图片，2: 精灵图
+      assets: [
+        // 1: 普通图片，2: 精灵图
         {
-          name: 'game-bg',
+          name: "game-bg",
           type: 1,
-          src: require('../../assets/rush/game-bg.png')
+          src: require("../../assets/rush/game-bg.png"),
         },
         {
-          name: 'game-bg2',
+          name: "game-bg2",
           type: 1,
-          src: require('../../assets/rush/game-bg2.png')
+          src: require("../../assets/rush/game-bg2.png"),
         },
         {
-          name: 'game-start',
+          name: "game-start",
           type: 1,
-          src: require('../../assets/rush/game-start.png')
+          src: require("../../assets/rush/game-start.png"),
         },
         {
-          name: 'game-tt',
+          name: "game-tt",
           type: 1,
-          src: require('../../assets/rush/game-tt.png')
+          src: require("../../assets/rush/game-tt.png"),
+        },
+        {
+          name: "cactus",
+          type: 1,
+          src: require("../../assets/rush/cactus.png"),
+        },
+        {
+          name: "gold",
+          type: 1,
+          src: require("../../assets/rush/gold.png"),
+        },
+        {
+          name: "rock",
+          type: 1,
+          src: require("../../assets/rush/rock.png"),
+        },
+        {
+          name: "wood1",
+          type: 1,
+          src: require("../../assets/rush/wood-1.png"),
+        },
+        {
+          name: "wood2",
+          type: 1,
+          src: require("../../assets/rush/wood-2.png"),
+        },
+        {
+          name: "people1",
+          type: 1,
+          src: require("../../assets/rush/people-1.png"),
+        },
+        {
+          name: "people2",
+          type: 1,
+          src: require("../../assets/rush/people-2.png"),
+        },
+        {
+          name: "people3",
+          type: 1,
+          src: require("../../assets/rush/people-3.png"),
+        },
+        {
+          name: "people",
+          type: 2,
+          src: require("../../assets/rush/people.png"),
+          options: {
+            frameWidth: 250,
+            frameHeight: 360
+          }
+        },
+        {
+          name: "brawler",
+          type: 2,
+          src: require("../../assets/rush/brawler48x48.png"),
+          options: {
+            frameWidth: 48,
+            frameHeight: 48
+          }
         }
-      ]
+      ],
     };
     this.options.config = Object.assign(this.options.config, config);
   }
 
-  preload(_this) {
-    console.log('加载资源...', _this);
-    this.load.setBaseURL(_this.options.baseURL);
+  preload() {
+    console.log("加载资源...", this.$game.options);
+    this.load.setBaseURL(this.$game.options.baseURL);
 
-    _this.options.assets.forEach(v => {
+    this.$game.options.assets.forEach((v) => {
       switch (v.type) {
         case 1:
           this.load.image(v.name, v.src);
@@ -84,52 +140,88 @@ class Game {
         case 2:
           this.load.spritesheet(v.name, v.src, v.options);
           break;
-      
+
         default:
           break;
       }
     });
   }
 
-  create(_this) {
-    console.log('create', _this);
+  create() {
+    console.log("create", this);
     // 背景
-    this.add.image(_this.gameWidth / 2, _this.desHeight / 2, 'game-bg');
+    let gameBg = this.add.image(
+      this.$game.gameWidth / 2,
+      this.$game.desHeight / 2,
+      "game-bg"
+    );
+    // let gameBg = this.add.image(0, 0, 'game-bg');
+    // Phaser.Display.Align.In.Center(gameBg, this.add.zone(_this.gameWidth / 2, _this.desHeight / 2, _this.gameWidth, _this.gameHeight));
+
     // 顶部标题文字
-    let gameTt = this.add.image(_this.gameWidth / 2, 155 + 70, 'game-tt').setAlpha(0);
+    let gameTt = this.add
+      .image(this.$game.gameWidth / 2, 0, "game-tt")
+      .setAlpha(0);
+
     // 开始按钮
-    let gameStart = this.add.image(_this.gameWidth / 2, _this.gameHeight - 280, 'game-start').setAlpha(0);
+    let gameStart = new Phaser.GameObjects.Image(this, 0, 0, "game-start");
+    gameBg.setInteractive();
+    gameBg.on(
+      "click",
+      this.$game.startGame,
+      this
+    );
+
     // 人数文本
-    this.add.text(0, _this.gameHeight - 220, '已有1789人参与游戏', { fontSize: '32px', fill: '#fff' });
+    let countText = new Phaser.GameObjects.Text(
+      this,
+      -this.$game.gameWidth / 2,
+      80,
+      "已有1789人参与游戏",
+      {
+        fontSize: "36px",
+        fill: "#fff",
+        align: "center",
+        fixedWidth: this.$game.gameWidth,
+      }
+    );
+
+    let btBox = this.add.container(0, 0, [gameStart, countText]).setAlpha(0);
+    Phaser.Display.Align.In.BottomCenter(btBox, gameBg);
+    console.log(btBox, gameBg);
 
     this.tweens.add({
-      targets: [gameTt, gameStart],
-      // x: 700,
-      alpha: 1, // 透明度
+      targets: [gameTt],
+      alpha: 1,
+      y: "+=225",
       duration: 1000,
-      // ease: 'Sine.easeInOut',
-      // yoyo: true,
-      // delay: 1000
+      ease: "Power3",
     });
-    // var particles = this.add.particles('red');
 
-    // var emitter = particles.createEmitter({
-    //     speed: 100,
-    //     scale: { start: 1, end: 0 },
-    //     blendMode: 'ADD'
-    // });
+    this.tweens.add({
+      targets: [btBox],
+      alpha: 1,
+      y: this.$game.gameHeight - 280,
+      duration: 1000,
+      ease: "Power3",
+    });
 
-    // var logo = this.physics.add.image(0, 0, 'game-tt');
-
-    // logo.setVelocity(100, 200);
-    // logo.setBounce(1, 1);
-    // logo.setCollideWorldBounds(true);
-
-    // emitter.startFollow(logo);
+    this.input.on(
+      "gameobjectup",
+      function(pointer, gameObject) {
+        gameObject.emit("click", gameObject);
+      },
+      this
+    );
   }
 
   update() {
-    console.log('update');
+    // console.log('update');
+  }
+
+  startGame() {
+    console.log("点击了");
+    this.scene.start("game");
   }
 
   init() {
@@ -138,4 +230,4 @@ class Game {
   }
 }
 
-export default Game
+export default Game;
