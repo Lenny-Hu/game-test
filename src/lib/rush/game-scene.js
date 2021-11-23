@@ -1,4 +1,4 @@
-// import Phaser from "phaser";
+import utils from "../utils";
 
 export default function (_this) {
   return [
@@ -71,7 +71,7 @@ export default function (_this) {
             _: this.add.particles('gold'),
             createEmitter (x, moveToX) {
               console.log('xxxx', x, moveToX);
-              this._.createEmitter({
+              return this._.createEmitter({
                 x,
                 y: gameHeight,
                 speedY: -100, // 移动速度，负值为反方向
@@ -79,7 +79,12 @@ export default function (_this) {
                 moveToY: 194,
                 lifespan: 4000, // 粒子存活时间 ms
                 scale: { start: 1, end: 0.3 }, // 缩放，开始值、最终值
-                frequency: Math.random() * 1000 + 1000, // 发射间隔 ms
+                frequency: utils.getRandomIntInclusive(1000, 2000), // 发射间隔 ms
+                alpha: {
+                  onEmit () {
+                    return Math.random() > 0.2 ? 1 : 0;
+                  }
+                }
               });
             }
           },
@@ -98,6 +103,58 @@ export default function (_this) {
                 frequency: 1000, // 发射间隔 ms
               });
             }
+          },
+          wood: {
+            l: null,
+            c: null,
+            r: null,
+            wood1: this.add.particles('wood1'),
+            wood2: this.add.particles('wood2'),
+            createEmitter (name, x, moveToX) {
+              return this[name].createEmitter({
+                x,
+                y: gameHeight,
+                speedY: -100, // 移动速度，负值为反方向
+                moveToX, // 移动到的目标x坐标点
+                moveToY: 194,
+                lifespan: 4000, // 粒子存活时间 ms
+                scale: { start: 1, end: 0.3 }, // 缩放，开始值、最终值
+                frequency: 1000, // 发射间隔 ms
+                // active: false
+                on: false, // false初始化不发射，调用emitParticle发射
+                // alpha: {
+                //   onEmit () {
+                //     return Math.random() > 0.8 ? 1 : 0;
+                //   }
+                // }
+              });
+            },
+            timer: null,
+            fire () {
+              // 随机最多2条道路出现木头
+              let map = {
+                1: 'l',
+                2: 'c',
+                3: 'r'
+              };
+
+              const fn = () => {
+                let arr = [];
+                let max = utils.getRandomIntInclusive(1, 2);
+                while (arr.length < max) {
+                  let n = utils.getRandomIntInclusive(1, 3);
+                  if (!arr.includes(n)) {
+                    arr.push(n);
+                  }
+                }
+                console.log(arr);
+
+                arr.forEach((v) => {
+                  Math.random() > 0.6 && particle.wood[map[v]].emitParticle();
+                })
+              }
+              this.timer = setInterval(fn, 1000);
+            }
           }
         };
         // 金币相关
@@ -112,6 +169,16 @@ export default function (_this) {
           particle.scenery.createEmitter('rock', -500, 240); // 左
           particle.scenery.createEmitter('rock', gameWidth + 500, 410); // 右
         }, 500);
+
+        // 木头
+        particle.wood.l = particle.wood.createEmitter('wood1', gameWidth / 2 - 414 * (zoom + 0.2), 300); // 左
+        particle.wood.c = particle.wood.createEmitter('wood1', gameWidth / 2, gameWidth / 2); // 中
+        particle.wood.r = particle.wood.createEmitter('wood1', gameWidth / 2 + 414 * (zoom + 0.2), 350); // 右
+
+        this.input.on('pointerup', function () {
+          console.log('点击发射');
+          particle.wood.fire();
+        });
 
         // var lifespan = 4000; // 粒子存活时间
         // // 计算速度
