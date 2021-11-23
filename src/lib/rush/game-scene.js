@@ -70,6 +70,7 @@ export default function (_this) {
           gold: { // 金币
             _: this.add.particles('gold'),
             createEmitter (x, moveToX) {
+              console.log('xxxx', x, moveToX);
               this._.createEmitter({
                 x,
                 y: gameHeight,
@@ -81,12 +82,36 @@ export default function (_this) {
                 frequency: Math.random() * 1000 + 1000, // 发射间隔 ms
               });
             }
+          },
+          scenery: { // 仙人掌 和 石头
+            cactus: this.add.particles('cactus'),
+            rock: this.add.particles('rock'),
+            createEmitter (name, x, moveToX) {
+              this[name].createEmitter({
+                x,
+                y: gameHeight,
+                speedY: -100, // 移动速度，负值为反方向
+                moveToX, // 移动到的目标x坐标点
+                moveToY: 194,
+                lifespan: 4000, // 粒子存活时间 ms
+                scale: { start: 3, end: 0.5 }, // 缩放，开始值、最终值
+                frequency: 1000, // 发射间隔 ms
+              });
+            }
           }
         };
         // 金币相关
-        particle.gold.l = particle.gold.createEmitter(-94 * (gameWidth / 640), 300); // 左
+        particle.gold.l = particle.gold.createEmitter(gameWidth / 2 - 414 * (zoom + 0.2), 300); // 左
         particle.gold.c = particle.gold.createEmitter(gameWidth / 2, gameWidth / 2); // 中
-        particle.gold.r = particle.gold.createEmitter(gameWidth + 94 * zoom, 350); // 右
+        particle.gold.r = particle.gold.createEmitter(gameWidth / 2 + 414 * (zoom + 0.2), 350); // 右
+
+        // 风景
+        particle.scenery.createEmitter('cactus', -500, 240); // 左
+        particle.scenery.createEmitter('cactus', gameWidth + 500, 410); // 右
+        setTimeout(() => {
+          particle.scenery.createEmitter('rock', -500, 240); // 左
+          particle.scenery.createEmitter('rock', gameWidth + 500, 410); // 右
+        }, 500);
 
         // var lifespan = 4000; // 粒子存活时间
         // // 计算速度
