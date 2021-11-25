@@ -33,6 +33,13 @@ class Game {
         width: this.gameWidth,
         height: this.gameHeight,
         zoom: this.zoom,
+        physics: {
+          default: 'arcade',
+          arcade: {
+            // gravity: { y: 200 },
+            debug: true
+          }
+        },
         // physics: {
         //   default: "arcade",
         //   arcade: {
