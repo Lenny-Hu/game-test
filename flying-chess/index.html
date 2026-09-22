@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>飞行棋 · Flying Chess</title>
+<style>
+  :root {
+    --ink: #2d3142;
+    --ink-soft: #5a6076;
+    --ink-faint: #8b90a3;
+    --paper: #fef6e4;
+    --card: #ffffff;
+    --line: rgba(45, 49, 66, 0.12);
+    --red: #ef5350;
+    --yellow: #f6b93b;
+    --blue: #3867d6;
+    --green: #20bf6b;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(900px 560px at 8% -8%, #ffe8d6 0%, transparent 58%),
+      radial-gradient(860px 560px at 102% 4%, #d7f0f7 0%, transparent 55%),
+      var(--paper);
+    padding: max(16px, env(safe-area-inset-top)) 14px calc(30px + env(safe-area-inset-bottom));
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: clamp(22px, 4.5vw, 32px); font-weight: 800; letter-spacing: .04em; }
+  h1 .plane { color: var(--blue); }
+  .back {
+    margin-left: auto; text-decoration: none; font-size: 13px; color: var(--ink-soft);
+    padding: 7px 14px; border-radius: 999px; border: 1px solid var(--line); background: var(--card);
+  }
+  .back:hover { color: var(--ink); border-color: var(--ink-faint); }
+
+  .layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .board-card {
+    flex: 1 1 460px; min-width: 300px;
+    background: var(--card); border-radius: 22px; border: 1px solid var(--line);
+    box-shadow: 0 12px 34px rgba(45,49,66,.10); padding: 10px; display: flex; justify-content: center;
+  }
+  canvas { width: 100%; max-width: 640px; height: auto; touch-action: manipulation; display: block; }
+
+  .side { flex: 1 1 300px; min-width: 280px; max-width: 420px; display: flex; flex-direction: column; gap: 12px; }
+  .panel {
+    background: var(--card); border-radius: 18px; border: 1px solid var(--line);
+    box-shadow: 0 8px 24px rgba(45,49,66,.07); padding: 14px 16px;
+  }
+  .panel h2 { font-size: 13px; letter-spacing: .1em; color: var(--ink-faint); font-weight: 700; margin-bottom: 10px; }
+
+  .hint { font-size: 12.5px; color: var(--ink-soft); line-height: 1.7; min-height: 20px; }
+  .hint b { color: var(--ink); }
+  .log { max-height: 150px; overflow-y: auto; font-size: 12.5px; line-height: 1.9; color: var(--ink-soft); border-top: 1px dashed var(--line); padding-top: 10px; }
+  .log .t { color: var(--ink-faint); margin-right: 4px; }
+
+  @media (max-width: 860px) {
+    .side { flex: 1 1 100%; max-width: none; }
+  }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn {
+    font: inherit; font-size: 13px; padding: 8px 14px; border-radius: 10px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink-soft);
+  }
+  .btn:hover { color: var(--ink); border-color: var(--ink-faint); }
+
+  .overlay {
+    position: fixed; inset: 0; background: rgba(45,49,66,.45); backdrop-filter: blur(3px);
+    display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
+  }
+  .overlay.hidden { display: none; }
+  .modal {
+    background: var(--card); border-radius: 22px; padding: 26px 28px; max-width: 460px; width: 100%;
+    box-shadow: 0 24px 70px rgba(0,0,0,.28); text-align: center;
+  }
+  .modal h2 { font-size: 24px; font-weight: 800; letter-spacing: .05em; }
+  .modal p { margin-top: 8px; font-size: 13.5px; color: var(--ink-soft); line-height: 1.8; }
+  .modal .choices { margin-top: 20px; display: flex; flex-direction: column; gap: 10px; }
+  .choice {
+    font: inherit; padding: 14px; border-radius: 14px; border: 2px solid var(--line); background: #fbfcfe;
+    cursor: pointer; font-size: 15px; font-weight: 700; color: var(--ink); transition: border-color .15s, transform .12s;
+  }
+  .choice:hover { border-color: var(--blue); transform: translateY(-1px); }
+  .choice small { display: block; margin-top: 3px; font-weight: 400; font-size: 12px; color: var(--ink-faint); }
+  .rules { text-align: left; font-size: 13px; line-height: 1.9; color: var(--ink-soft); }
+  .rules b { color: var(--ink); }
+  .rules ul { padding-left: 18px; margin-top: 4px; }
+  .win-title { font-size: 26px; }
+  footer { margin-top: 14px; text-align: center; font-size: 12px; color: var(--ink-faint); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="plane">✈</span> 飞行棋</h1>
+    <a class="back" href="../index.html">← 返回合集</a>
+  </header>
+
+  <div class="layout">
+    <div class="board-card"><canvas id="board" width="660" height="660"></canvas></div>
+
+    <div class="side">
+      <div class="panel">
+        <h2>战况</h2>
+        <p class="hint" id="hint"></p>
+        <div class="log" id="log" style="margin-top:10px"></div>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn" id="rulesBtn">规则说明</button>
+        <button class="btn" id="restartBtn">重新开始</button>
+        <button class="btn" id="muteBtn">音效: 开</button>
+      </div>
+    </div>
+  </div>
+  <footer>纯前端单文件 · 零依赖 · 支持 1-2 人同屏，其余座位由电脑填补</footer>
+</div>
+
+<!-- 开局选择 -->
+<div class="overlay" id="setupOverlay">
+  <div class="modal">
+    <h2>✈ 飞行棋</h2>
+    <p>经典四人飞行棋：投 6 起飞，绕场一周再冲入终点航道。<br>选择本局真人玩家数量，空位由电脑玩家接管。</p>
+    <div class="choices">
+      <button class="choice" data-mode="1">单人模式<small>你执 ✈红 · 电脑执 黄 / 蓝 / 绿</small></button>
+      <button class="choice" data-mode="2">双人同屏<small>你与伙伴执 ✈红 ✈黄 · 电脑执 蓝 / 绿</small></button>
+    </div>
+  </div>
+</div>
+
+<!-- 规则 -->
+<div class="overlay hidden" id="rulesOverlay">
+  <div class="modal">
+    <h2>规则说明</h2>
+    <div class="rules">
+      <ul>
+        <li><b>起飞</b>：投出 <b>6</b> 才能把飞机从机库移到起飞点；投出 6 可<b>再掷一次</b>。</li>
+        <li><b>连掷三个 6</b>：本次作废直接交棒（经典惩罚）。</li>
+        <li><b>行进</b>：沿同色箭头方向绕外圈飞行一整圈后，转入本色<b>终点航道</b>直抵中心。</li>
+        <li><b>同色飞跃</b>：正好落在本色 ★ 跳点上，额外前进 4 格（不连锁触发）。</li>
+        <li><b>撞击</b>：落在对手所在的<b>主航道</b>格上，对手机被击回机库，你获得一次<b>重掷</b>；终点航道内不可被撞击。</li>
+        <li><b>到达中心</b>：需<b>精确点数</b>，多出的点数沿原路后退（反弹）。</li>
+        <li><b>胜利</b>：4 架飞机全部抵达中心即获胜，本局结束。</li>
+        <li>真人回合：点击<b>己方机库中的骰子</b>（或按空格）掷骰；若有多架可动飞机，<b>点击棋盘上闪烁的 ✈</b> 选择要动的那架。</li>
+      </ul>
+    </div>
+    <div class="choices"><button class="choice" id="closeRules">明白了</button></div>
+  </div>
+</div>
+
+<!-- 结算 -->
+<div class="overlay hidden" id="winOverlay">
+  <div class="modal">
+    <h2 class="win-title" id="winTitle"></h2>
+    <p id="winDetail"></p>
+    <div class="choices">
+      <button class="choice" id="againBtn">再来一局</button>
+      <button class="choice" id="homeBtn" style="font-weight:400">返回合集</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ============================================================
+ * 飞行棋 · 单文件实现
+ * 棋盘：15×15 格。主航道为 56 格闭环（4 臂 × 13 格 + 4 转角格，臂尖属主航道），
+ *       每臂中列 5 格为该臂颜色的终点航道，中央 3×3 为终点区。
+ * 每架飞机相对位置 r：-1 机库 · 0..62 主航道 · 63..67 终点航道 · 68 中心
+ * ============================================================ */
+
+// ---------- 颜色与几何 ----------
+// 真实飞行棋布局：56 格闭环（每臂 13 格 + 1 转角格），臂尖格属主航道；
+// 飞机绕行一整圈后第二次经过臂尖时转入本臂中列的终点航道（5 格）直抵中心。
+// 相对位置 r：-1 机库 · 0..62 主航道 · 63..67 终点航道 · 68 中心
+const COLORS = [
+  { id: 0, name: '红', hex: '#ef5350', soft: 'rgba(239,83,80,.18)',  start: 0  },
+  { id: 1, name: '黄', hex: '#f6b93b', soft: 'rgba(246,185,59,.22)', start: 14 },
+  { id: 2, name: '蓝', hex: '#3867d6', soft: 'rgba(56,103,214,.16)',  start: 28 },
+  { id: 3, name: '绿', hex: '#20bf6b', soft: 'rgba(32,191,107,.18)',  start: 42 },
+];
+const RING_N = 56, RING_END = 62, LANE_END = 67, CENTER_R = 68;
+const JUMP_RS = [4, 8];     // 同色跳点（起飞后第 4 / 8 格），落地 +4 飞跃
+
+// 主航道 56 格 [row, col]，按行进方向（顺时针）编号
+const RING = [
+  // 上臂（红）：左列上行 → 臂尖 → 右列下行 → 转角
+  [5,6],[4,6],[3,6],[2,6],[1,6],[0,6],[0,7],[0,8],[1,8],[2,8],[3,8],[4,8],[5,8], [5,9],
+  // 右臂（黄）
+  [6,9],[6,10],[6,11],[6,12],[6,13],[6,14],[7,14],[8,14],[8,13],[8,12],[8,11],[8,10],[8,9], [9,9],
+  // 下臂（蓝）
+  [9,8],[10,8],[11,8],[12,8],[13,8],[14,8],[14,7],[14,6],[13,6],[12,6],[11,6],[10,6],[9,6], [9,5],
+  // 左臂（绿）
+  [8,5],[8,4],[8,3],[8,2],[8,1],[8,0],[7,0],[6,0],[6,1],[6,2],[6,3],[6,4],[6,5], [5,5],
+];
+
+// 终点航道（5 格，从臂尖内侧向中心飞行）；中心格 (7,7) 为公共终点
+const LANES = [
+  [[1,7],[2,7],[3,7],[4,7],[5,7]],     // 红：上臂中列，向南入心
+  [[7,13],[7,12],[7,11],[7,10],[7,9]], // 黄：右臂中列，向西入心
+  [[13,7],[12,7],[11,7],[10,7],[9,7]], // 蓝：下臂中列，向北入心
+  [[7,1],[7,2],[7,3],[7,4],[7,5]],     // 绿：左臂中列，向东入心
+];
+
+// 臂归属（用于同色涂装的格子）：上臂 idx0-11 / 转角12 → 0 号臂…
+// 颜色 c 的主航道"本色段" = RING[start_c .. start_c+11]
+// 机库（停机坪）四角象限的 4 个机位（浮点格坐标，四角布局，中央留给骰子）
+// 左上/右上/左下框覆盖格 0..5（中心 2.5），右下框覆盖格 9..14（中心 11.5），机位需对称于框中心
+const HANGARS = [
+  { cr: 1.2, cc: 1.2 }, { cr: 1.2, cc: 3.8 }, { cr: 3.8, cc: 1.2 }, { cr: 3.8, cc: 3.8 }, // 红=左上
+  { cr: 1.2, cc: 12.8 }, { cr: 1.2, cc: 10.2 }, { cr: 3.8, cc: 12.8 }, { cr: 3.8, cc: 10.2 }, // 黄=右上
+  { cr: 12.8, cc: 12.8 }, { cr: 12.8, cc: 10.2 }, { cr: 10.2, cc: 12.8 }, { cr: 10.2, cc: 10.2 }, // 蓝=右下
+  { cr: 12.8, cc: 1.2 }, { cr: 12.8, cc: 3.8 }, { cr: 10.2, cc: 1.2 }, { cr: 10.2, cc: 3.8 },  // 绿=左下
+];
+// 机库中心（骰子位置，[row, col]）与机库矩形
+const HANGAR_CTR = [[2.5, 2.5], [2.5, 11.5], [11.5, 11.5], [11.5, 2.5]];
+function hangarRect(c) {
+  const colBlock = (c === 0 || c === 3) ? 0 : 9, rowBlock = (c === 0 || c === 1) ? 0 : 9;
+  return [colBlock * C + C * .5, rowBlock * C + C * .5, C * 5, C * 5];
+}
+// 中心终点区内 4 色的落位（红自上入、黄自右入、蓝自下入、绿自左入）
+const CENTER_SPOTS = [[6.72,7.28],[7.28,7.72],[7.72,7.28],[7.28,6.72]]; // 红上 黄右 蓝下 绿左
+
+const CELLS = 15, C = 44, PAD = 0; // canvas 15*44=660
+const ringIdxOf = (c, r) => (COLORS[c].start + r) % RING_N;
+
+function gridOf(c, r, slot) {
+  if (r < 0) { const h = HANGARS[c * 4 + slot]; return [h.cr, h.cc]; }
+  if (r <= RING_END) return RING[ringIdxOf(c, r)];
+  if (r <= LANE_END) return LANES[c][r - (RING_END + 1)];
+  return CENTER_SPOTS[c];
+}
+
+// ---------- 游戏状态 ----------
+let S = null;
+function newState(humans) {
+  return {
+    humans,                       // 真人数量 1|2（红、黄依次）
+    cur: 0,                       // 当前颜色
+    pieces: [0,1,2,3].map(ci => [0,1,2,3].map(() => ({ r: -1 }))),
+    sixStreak: 0,
+    die: null,
+    dieFace: null,                // 机库里画布骰子的显示点数
+    phase: 'idle',                // idle|choose|anim|over
+    movable: [],                  // 等待真人选择的飞机索引
+    winner: -1,
+    lastMove: null,               // {cells:[[r,c]...]} 高亮
+    flash: null,                  // 撞击闪光格
+  };
+}
+const isAI = c => c >= S.humans;
+const isHumanTurn = () => !isAI(S.cur);
+const arrivedCount = c => S.pieces[c].filter(p => p.r === CENTER_R).length;
+
+// ---------- 走法计算 ----------
+function landR(p, die) {                 // 模拟：pre=入超/反弹后落点，final=含飞跃的终点
+  let r = p.r === -1 ? 0 : p.r + die, bounce = false;
+  if (r > CENTER_R) { r = 2 * CENTER_R - r; bounce = true; }
+  const pre = r;
+  if (r <= RING_END && JUMP_RS.includes(r) && r + 4 <= RING_END) r += 4;   // 同色飞跃（不连锁）
+  return { pre, final: r, bounce };
+}
+function capturesAt(c, r) {              // 落于主航道 r 时的撞击列表
+  if (r > RING_END) return [];
+  const idx = ringIdxOf(c, r), out = [];
+  for (let o = 0; o < 4; o++) {
+    if (o === c) continue;
+    S.pieces[o].forEach((p, i) => { if (p.r >= 0 && p.r <= RING_END && ringIdxOf(o, p.r) === idx) out.push({ o, i }); });
+  }
+  return out;
+}
+function legalFor(c, die) {
+  const res = [];
+  S.pieces[c].forEach((p, i) => {
+    if (p.r === -1) { if (die === 6) res.push({ i, takeoff: true, ...landR(p, die) }); }
+    else if (p.r < CENTER_R) res.push({ i, takeoff: false, ...landR(p, die) });
+  });
+  res.forEach(m => m.caps = capturesAt(c, m.final));
+  return res;
+}
+function dangerIdx(c, r) {               // 该位置被几家对手在 1..6 步内盯上
+  if (r < 0 || r > RING_END) return 0;
+  const idx = ringIdxOf(c, r);
+  let n = 0;
+  for (let o = 0; o < 4; o++) {
+    if (o === c) continue;
+    S.pieces[o].forEach(p => {
+      if (p.r >= 0 && p.r <= RING_END) { const d = (idx - ringIdxOf(o, p.r) + RING_N) % RING_N; if (d >= 1 && d <= 6) n++; }
+    });
+  }
+  return n;
+}
+
+// ---------- AI ----------
+function aiPick(c, die) {
+  const moves = legalFor(c, die);
+  if (!moves.length) return null;
+  let best = null, bestScore = -1e9;
+  const meOut = S.pieces[c].filter(p => p.r >= 0 && p.r < CENTER_R).length;
+  for (const m of moves) {
+    const p = S.pieces[c][m.i];
+    let s = Math.random() * 2;
+    if (m.caps.length) s += 60 + m.caps.length * 25;
+    if (m.final === CENTER_R) s += 90;
+    if (m.takeoff) s += meOut < 2 ? 48 : 30;
+    if (p.r === -1) s -= 0; else s += (m.final / CENTER_R) * 14;
+    s += (dangerIdx(c, p.r) - dangerIdx(c, m.final)) * 16;   // 逃离威胁加分
+    if (!m.takeoff && m.final > RING_END && p.r <= RING_END) s += 12; // 转入终点航道
+    if (s > bestScore) { bestScore = s; best = m; }
+  }
+  return best;
+}
+
+// ---------- 音效 ----------
+let AC = null, muted = false;
+function beep(freq, dur = .07, type = 'square', vol = .08) {
+  if (muted) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.value = freq; g.gain.value = vol;
+    o.connect(g); g.connect(AC.destination); o.start();
+    g.gain.exponentialRampToValueAtTime(.0001, AC.currentTime + dur);
+    o.stop(AC.currentTime + dur + .02);
+  } catch (e) {}
+}
+const snd = {
+  dice: () => beep(300, .05, 'square', .05),
+  move: () => beep(520, .05, 'triangle', .06),
+  jump: () => { beep(660, .08); setTimeout(() => beep(880, .1), 70); },
+  capture: () => { beep(180, .12, 'sawtooth', .1); setTimeout(() => beep(120, .16, 'sawtooth', .1), 90); },
+  finish: () => { [660, 880, 1100].forEach((f, i) => setTimeout(() => beep(f, .12, 'triangle', .1), i * 110)); },
+  win: () => { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => beep(f, .16, 'triangle', .12), i * 140)); },
+  bad: () => beep(150, .2, 'sawtooth', .08),
+};
+
+// ---------- 绘制 ----------
+const cv = document.getElementById('board'), ctx = cv.getContext('2d');
+const X = c => (c + .5) * C, Y = r => (r + .5) * C;
+
+function rr(x, y, w, h, rad) {
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y); ctx.arcTo(x + w, y, x + w, y + h, rad); ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad); ctx.arcTo(x, y, x + w, y, rad); ctx.closePath();
+}
+
+const DIE_PIPS = { 1:[[0,0]], 2:[[-1,-1],[1,1]], 3:[[-1,-1],[0,0],[1,1]], 4:[[-1,-1],[-1,1],[1,-1],[1,1]], 5:[[-1,-1],[-1,1],[0,0],[1,-1],[1,1]], 6:[[-1,-1],[-1,0],[-1,1],[1,-1],[1,0],[1,1]] };
+function drawDie(x, y, s, face, color, canRoll) {
+  ctx.save();
+  if (canRoll) {
+    const p = .5 + .5 * Math.sin(performance.now() / 300);
+    ctx.strokeStyle = color; ctx.globalAlpha = .3 + .5 * p; ctx.lineWidth = 3;
+    const e = 5 + 5 * p;
+    rr(x - s / 2 - e, y - s / 2 - e, s + e * 2, s + e * 2, 16); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  ctx.shadowColor = 'rgba(45,49,66,.28)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+  ctx.fillStyle = '#fff'; rr(x - s / 2, y - s / 2, s, s, 12); ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = color; ctx.lineWidth = 2; rr(x - s / 2, y - s / 2, s, s, 12); ctx.stroke();
+  if (!face) {
+    ctx.fillStyle = '#c3c7d4'; ctx.font = `800 ${Math.round(s * .45)}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('?', x, y + 1);
+  } else {
+    const g = s * .26, pr = s * .085;
+    ctx.fillStyle = '#2d3142';
+    for (const [dx, dy] of DIE_PIPS[face]) { ctx.beginPath(); ctx.arc(x + dx * g, y + dy * g, pr, 0, 7); ctx.fill(); }
+  }
+  ctx.restore();
+}
+
+function drawBoard() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  // 机库（含玩家信息：阵营名 / 真人·电脑徽章 / 已抵达数，当前回合呼吸高亮）
+  for (let c = 0; c < 4; c++) {
+    const [x0, y0, w, h] = hangarRect(c);
+    const rowBlock = y0 < C * 5 ? 0 : 9;
+    const active = S.cur === c && S.winner < 0;
+    ctx.fillStyle = COLORS[c].soft; rr(x0, y0, w, h, 18); ctx.fill();
+    ctx.save();
+    ctx.strokeStyle = COLORS[c].hex;
+    ctx.globalAlpha = active ? .55 + .4 * Math.abs(Math.sin(performance.now() / 450)) : .4;
+    ctx.lineWidth = active ? 3.5 : 2;
+    if (active) { ctx.shadowColor = COLORS[c].hex; ctx.shadowBlur = 14; }
+    rr(x0, y0, w, h, 18); ctx.stroke();
+    ctx.restore();
+    HANGARS.slice(c * 4, c * 4 + 4).forEach(p => {
+      ctx.beginPath(); ctx.arc(X(p.cc), Y(p.cr), C * .42, 0, 7);
+      ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.strokeStyle = COLORS[c].hex; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]); ctx.stroke(); ctx.setLineDash([]);
+    });
+    const hy = rowBlock === 0 ? y0 + C * .45 : y0 + h - C * .32;
+    ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'left';
+    ctx.font = '800 16px sans-serif'; ctx.fillStyle = COLORS[c].hex;
+    ctx.fillText(COLORS[c].name + '方', x0 + C * .5, hy);
+    const nw = ctx.measureText(COLORS[c].name + '方').width;
+    const kind = isAI(c) ? '电脑' : (c === 0 ? '真人 1' : '真人 2');
+    ctx.font = '600 11px sans-serif';
+    const kw = ctx.measureText(kind).width, px = x0 + C * .5 + nw + 8;
+    ctx.fillStyle = '#fff'; rr(px, hy - 12, kw + 12, 16, 8); ctx.fill();
+    ctx.strokeStyle = COLORS[c].hex; ctx.globalAlpha = .7; ctx.lineWidth = 1; rr(px, hy - 12, kw + 12, 16, 8); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = COLORS[c].hex; ctx.fillText(kind, px + 6, hy);
+    ctx.font = '700 13px sans-serif'; ctx.textAlign = 'right'; ctx.fillStyle = COLORS[c].hex;
+    ctx.fillText('✈ ' + arrivedCount(c) + '/4', x0 + w - C * .45, hy);
+    ctx.textAlign = 'left';
+  }
+  // 当前行动方机库中央的骰子（真人回合时脉冲提示可点击）
+  if (S.phase !== 'over') {
+    const [hr, hc] = HANGAR_CTR[S.cur];
+    drawDie(X(hc), Y(hr), C * 1.5, S.dieFace, COLORS[S.cur].hex, S.phase === 'idle' && isHumanTurn() && S.winner < 0);
+  }
+  // 主航道格
+  const colorOfIdx = i => { for (let c = 0; c < 4; c++) { const s = COLORS[c].start; if ((i - s + RING_N) % RING_N < 13) return c; } return -1; };
+  RING.forEach(([r, c], i) => {
+    const own = colorOfIdx(i);
+    ctx.fillStyle = own >= 0 ? COLORS[own].soft : '#f4f5f9';
+    rr(X(c) - C * .46, Y(r) - C * .46, C * .92, C * .92, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(45,49,66,.16)'; ctx.lineWidth = 1; rr(X(c) - C * .46, Y(r) - C * .46, C * .92, C * .92, 7); ctx.stroke();
+    if (own >= 0 && JUMP_RS.some(jr => ringIdxOf(own, jr) === i)) {          // 同色跳点 ★
+      ctx.fillStyle = COLORS[own].hex; ctx.globalAlpha = .85; ctx.font = '700 16px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('★', X(c), Y(r)); ctx.globalAlpha = 1;
+    } else if (own >= 0 && COLORS[own].start === i) {                        // 起飞点箭头
+      drawArrowInto(i, COLORS[own].hex);
+    }
+  });
+  // 终点航道
+  LANES.forEach((lane, c) => lane.forEach(([r, cc], k) => {
+    ctx.fillStyle = COLORS[c].soft;
+    rr(X(cc) - C * .46, Y(r) - C * .46, C * .92, C * .92, 7); ctx.fill();
+    ctx.strokeStyle = COLORS[c].hex; ctx.globalAlpha = .55; ctx.lineWidth = 1.4;
+    rr(X(cc) - C * .46, Y(r) - C * .46, C * .92, C * .92, 7); ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = COLORS[c].hex; ctx.globalAlpha = .8; ctx.font = '600 10px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('»»', X(cc), Y(r)); ctx.globalAlpha = 1;
+  }));
+  // 中心终点：3×3 方块按"入心方向"分四色三角（红自上、黄自右、蓝自下、绿自左）
+  const cx = X(7), cy = Y(7), hs = C * 1.5;
+  ctx.save();
+  const tris = [ // [颜色, 底边两端点(相对中心)]
+    [0, [-hs, -hs], [hs, -hs]],   // 红：上
+    [1, [hs, -hs], [hs, hs]],     // 黄：右
+    [2, [hs, hs], [-hs, hs]],     // 蓝：下
+    [3, [-hs, hs], [-hs, -hs]],   // 绿：左
+  ];
+  for (const [ci, a, b] of tris) {
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + a[0], cy + a[1]); ctx.lineTo(cx + b[0], cy + b[1]); ctx.closePath();
+    ctx.fillStyle = COLORS[ci].soft; ctx.fill();
+    ctx.strokeStyle = COLORS[ci].hex; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(cx, cy, 15, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+  ctx.strokeStyle = 'rgba(45,49,66,.3)'; ctx.stroke();
+  ctx.fillStyle = '#2d3142'; ctx.font = '700 11px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('终点', cx, cy);
+  ctx.restore();
+}
+function drawArrowInto(i, color) {
+  const [r, c] = RING[i], [nr, nc] = RING[(i + 1) % RING_N];
+  const dx = Math.sign(nc - c), dy = Math.sign(nr - r);
+  ctx.save(); ctx.translate(X(c), Y(r)); ctx.rotate(Math.atan2(dy, dx));
+  ctx.fillStyle = color; ctx.beginPath();
+  ctx.moveTo(C * .26, 0); ctx.lineTo(-C * .1, -C * .18); ctx.lineTo(-C * .1, C * .18); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawPieces() {
+  const byCell = new Map();
+  const order = [];
+  S.pieces.forEach((grp, c) => grp.forEach((p, i) => {
+    const g = gridOf(c, p.r, i);
+    const kk = (p.r < 0) ? `h${c}${i}` : p.r > RING_END ? `${p.r === CENTER_R ? 'c' : 'l'}${c}` : `r${ringIdxOf(c, p.r)}`;
+    const n = (byCell.get(kk) || 0); byCell.set(kk, n + 1);
+    order.push({ c, i, p, g, off: n });
+  }));
+  for (const it of order) {
+    let [r, c] = it.g;
+    if (it.off) { r += (it.off % 2 ? .16 : -.16); c += (it.off < 2 ? .16 : -.16); }
+    const x = X(c), y = Y(r);
+    const isSel = S.movable.includes(it.i) && S.cur === it.c && S.phase === 'choose';
+    const isLast = S.lastMove && S.lastMove.c === it.c && S.lastMove.i === it.i;
+    ctx.save();
+    if (it.p.r === -1) ctx.globalAlpha = .92;
+    // 机库中的飞机稍小
+    const scale = it.p.r === -1 ? .92 : 1;
+    if (isSel) { const pulse = 1 + .12 * Math.sin(performance.now() / 180); drawPlane(x, y, COLORS[it.c].hex, scale * pulse, true); }
+    else drawPlane(x, y, COLORS[it.c].hex, scale, isLast);
+    ctx.restore();
+  }
+}
+function drawPlane(x, y, color, scale, ring) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+  if (ring) { ctx.beginPath(); ctx.arc(0, 0, C * .44, 0, 7); ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.fill();
+    ctx.strokeStyle = color; ctx.lineWidth = 2.5; ctx.stroke(); }
+  // 机身+机翼（简化飞机轮廓，头朝右上）
+  ctx.rotate(-Math.PI / 4);
+  ctx.beginPath();
+  ctx.moveTo(14, 0);
+  ctx.lineTo(3, 3); ctx.lineTo(-2, 12); ctx.lineTo(-5, 12); ctx.lineTo(-2, 2);
+  ctx.lineTo(-9, 1); ctx.lineTo(-12, 5); ctx.lineTo(-13, 4); ctx.lineTo(-11, -1); ctx.lineTo(-13, -6); ctx.lineTo(-12, -7); ctx.lineTo(-9, -3);
+  ctx.lineTo(-2, -4); ctx.lineTo(-5, -14); ctx.lineTo(-2, -14); ctx.lineTo(3, -5); ctx.lineTo(12, -3);
+  ctx.closePath();
+  ctx.fillStyle = color; ctx.shadowColor = 'rgba(0,0,0,.25)'; ctx.shadowBlur = 4; ctx.shadowOffsetY = 2; ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = 'rgba(0,0,0,.25)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.restore();
+}
+function drawFlash() {
+  if (!S.flash) return;
+  const t = (performance.now() - S.flash.t0) / 500;
+  if (t > 1) { S.flash = null; return; }
+  ctx.fillStyle = `rgba(239,83,80,${(1 - t) * .55})`;
+  ctx.beginPath(); ctx.arc(X(S.flash.c), Y(S.flash.r), C * (.5 + t), 0, 7); ctx.fill();
+}
+function render() { drawBoard(); drawPieces(); drawFlash(); requestAnimationFrame(render); }
+
+// ---------- UI ----------
+const el = id => document.getElementById(id);
+const hintEl = el('hint'), logEl = el('log');
+function setHint(html) { hintEl.innerHTML = html; }
+function log(msg) {
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  logEl.insertAdjacentHTML('afterbegin', `<div><span class="t">${t}</span>${msg}</div>`);
+  while (logEl.children.length > 40) logEl.lastChild.remove();
+}
+
+// ---------- 流程 ----------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let token = 0;                                        // 重开局时终止旧动画链
+
+async function startRoll() {
+  if (S.phase !== 'idle' || S.winner >= 0) return;   // 防止重叠触发（重开局旧定时器/测试驱动）
+  const my = ++token;
+  S.phase = 'anim';
+  // 骰子动画（画在当前机库中央）
+  const die = 1 + Math.floor(Math.random() * 6);
+  for (let i = 0; i < 8; i++) { if (my !== token) return; S.dieFace = 1 + Math.floor(Math.random() * 6); snd.dice(); await sleep(55); }
+  S.dieFace = die;
+  S.die = die;
+  const c = S.cur, cname = COLORS[c].name;
+  log(`<b style="color:${COLORS[c].hex}">${cname}</b> 投出 ${die}`);
+  await sleep(300); if (my !== token) return;
+
+  if (die === 6) S.sixStreak++; else S.sixStreak = 0;
+  if (S.sixStreak >= 3) {
+    log(`${cname}方 连掷三个 6，本次作废！`); snd.bad(); S.sixStreak = 0;
+    await sleep(600); if (my === token) nextTurn(false); return;
+  }
+
+  const moves = legalFor(c, die);
+  if (!moves.length) {
+    setHint(`${cname}方 投出 ${die}，但没有可动的飞机${die !== 6 ? '（需 6 起飞）' : ''}。`);
+    await sleep(900); if (my === token) nextTurn(die === 6); return;
+  }
+  if (isHumanTurn()) {
+    const allTakeoff = moves.every(m => m.takeoff);
+    if (moves.length === 1 || allTakeoff) { await doMove(moves[0], my); }
+    else {
+      S.phase = 'choose'; S.movable = moves.map(m => m.i);
+      setHint(`投出 <b>${die}</b>，点击棋盘上闪烁的 ✈ 选择要移动的飞机`);
+      S.pendingMoves = moves;
+    }
+  } else {
+    await sleep(400); if (my !== token) return;
+    await doMove(aiPick(c, die), my);
+  }
+}
+
+async function doMove(mv, my) {
+  if (!mv) { nextTurn(false); return; }
+  S.movable = []; S.pendingMoves = null;
+  const c = S.cur, p = S.pieces[c][mv.i], cname = COLORS[c].name;
+  S.phase = 'anim';
+  const from = p.r;
+  const path = [];
+  if (mv.takeoff) path.push(0);
+  else {
+    let r = p.r + S.die;
+    if (r > CENTER_R) { const back = 2 * CENTER_R - r; for (let k = p.r + 1; k <= CENTER_R; k++) path.push(k); for (let k = CENTER_R - 1; k >= back; k--) path.push(k); }
+    else for (let r2 = p.r + 1; r2 <= r; r2++) path.push(r2);
+  }
+  let target = path[path.length - 1];
+  // 同色飞跃：补一段弧位移动画
+  let jumpTo = -1;
+  if (!mv.takeoff && target <= RING_END && JUMP_RS.includes(target) && mv.final > target) jumpTo = mv.final;
+
+  for (const r of path) { if (my !== token) return; p.r = r; snd.move(); await sleep(path.length > 8 ? 70 : 130); }
+  if (mv.bounce) log(`${cname}方 点数超出，从中心反弹`);
+  if (jumpTo >= 0) {
+    if (my !== token) return;
+    snd.jump(); log(`${cname}方 命中 ★ 跳点，飞跃到第 ${jumpTo} 格！`);
+    for (let k = 1; k <= 6; k++) {                       // 弧位渐进（同臂内 r 单调，无越界）
+      p.r = Math.round(target + (jumpTo - target) * (k / 6));
+      await sleep(40); if (my !== token) return;
+    }
+    p.r = jumpTo; target = jumpTo;
+  }
+  S.lastMove = { c, i: mv.i };
+
+  // 撞击
+  let captured = false;
+  for (const cap of (mv.caps || [])) {
+    if (my !== token) return;
+    const victim = S.pieces[cap.o][cap.i];
+    const g = gridOf(cap.o, victim.r, cap.i);
+    S.flash = { r: g[0], c: g[1], t0: performance.now() };
+    victim.r = -1; captured = true; snd.capture();
+    log(`<b style="color:${COLORS[cap.o].hex}">${COLORS[cap.o].name}</b>方 一架飞机被击回机库！`);
+    await sleep(320);
+  }
+  if (target === CENTER_R) { snd.finish(); log(`${cname}方 一架飞机抵达中心！（${arrivedCount(c)}/4）`); }
+
+  // 胜负
+  if (arrivedCount(c) === 4) { S.winner = c; gameOver(); return; }
+  await sleep(450); if (my === token) nextTurn(S.die === 6 || captured);
+}
+
+function nextTurn(extra) {
+  if (S.winner >= 0) return;
+  if (!extra) { S.cur = (S.cur + 1) % 4; S.sixStreak = 0; }
+  S.phase = 'idle'; S.die = null; S.dieFace = null;
+  if (extra) setHint(`<b style="color:${COLORS[S.cur].hex}">${COLORS[S.cur].name}</b>方 获得再掷一次的机会！`);
+  else if (isHumanTurn()) setHint(`<b>${COLORS[S.cur].name}</b>方（真人）请掷骰子：点击己方机库中的骰子，或按空格`);
+  else setHint(`轮到 <b style="color:${COLORS[S.cur].hex}">${COLORS[S.cur].name}</b>方（电脑）`);
+  if (isAI(S.cur)) {
+    const my = token;
+    setTimeout(() => { if (my === token) startRoll(); }, extra ? 800 : 750);
+  }
+}
+
+function gameOver() {
+  S.phase = 'over'; snd.win();
+  const w = COLORS[S.winner];
+  const rank = [0,1,2,3].sort((a, b) => arrivedCount(b) - arrivedCount(a) || (S.pieces[b].filter(p=>p.r>=0).length - S.pieces[a].filter(p=>p.r>=0).length));
+  el('winTitle').textContent = `🏆 ${w.name}方获胜！`;
+  el('winTitle').style.color = w.hex;
+  el('winDetail').innerHTML = '名次：' + rank.map(ci => `${COLORS[ci].name}${isAI(ci) ? '💻' : '🧑'}`).join(' › ') +
+    `<br>${isAI(S.winner) ? '电脑玩家赢了，人类玩家再接再厉！' : '恭喜！你击败了电脑玩家！'}`;
+  el('winOverlay').classList.remove('hidden');
+}
+
+// ---------- 输入 ----------
+function canvasPoint(ev) {
+  const rect = cv.getBoundingClientRect(), scale = cv.width / rect.width;
+  return [(ev.clientX - rect.left) * scale, (ev.clientY - rect.top) * scale];
+}
+cv.addEventListener('click', ev => {
+  if (!isHumanTurn() || S.winner >= 0) return;
+  const [px, py] = canvasPoint(ev);
+  if (S.phase === 'idle') {
+    // 点击当前行动方机库（含骰子）即掷骰
+    const [hx, hy, hw, hh] = hangarRect(S.cur);
+    if (px >= hx && px <= hx + hw && py >= hy && py <= hy + hh) startRoll();
+    return;
+  }
+  if (S.phase !== 'choose') return;
+  let hit = null;
+  S.pieces[S.cur].forEach((p, i) => {
+    if (!S.movable.includes(i)) return;
+    const g = gridOf(S.cur, p.r, i), x = X(g[1]), y = Y(g[0]);
+    if ((px - x) ** 2 + (py - y) ** 2 < (C * .55) ** 2) hit = i;
+  });
+  if (hit === null) return;
+  const my = ++token; S.phase = 'anim';
+  doMove(S.pendingMoves.find(m => m.i === hit), my);
+});
+document.addEventListener('keydown', ev => { if (ev.code === 'Space' && S && S.phase === 'idle' && isHumanTurn()) { ev.preventDefault(); startRoll(); } });
+
+el('rulesBtn').onclick = () => el('rulesOverlay').classList.remove('hidden');
+el('closeRules').onclick = () => el('rulesOverlay').classList.add('hidden');
+el('muteBtn').onclick = () => { muted = !muted; el('muteBtn').textContent = muted ? '音效: 关' : '音效: 开'; };
+el('restartBtn').onclick = () => el('setupOverlay').classList.remove('hidden');
+el('againBtn').onclick = () => { el('winOverlay').classList.add('hidden'); el('setupOverlay').classList.remove('hidden'); };
+el('homeBtn').onclick = () => location.href = '../index.html';
+document.querySelectorAll('#setupOverlay .choice').forEach(b => b.addEventListener('click', () => {
+  el('setupOverlay').classList.add('hidden');
+  startGame(+b.dataset.mode);
+}));
+
+function startGame(humans) {
+  token++;
+  document.querySelectorAll('#setupOverlay .choice').forEach(b => b.style.fontWeight = '');
+  S = newState(humans);
+  logEl.innerHTML = '';
+  log(`新对局开始：${humans === 1 ? '单人模式（你执红）' : '双人同屏（你执红黄）'}，其余为电脑。`);
+  setHint(`<b>${COLORS[0].name}</b>方（真人）请掷骰子：点击己方机库中的骰子，或按空格`);
+}
+startGame(1);
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

@@ -166,6 +166,21 @@
 // requiresServer: 是否必须用本地服务器打开 | note: 额外提醒
 const GAMES = [
   {
+    dir: 'flying-chess',
+    name: '飞行棋',
+    sub: 'FLYING CHESS · Canvas 2D',
+    badge: '桌游',
+    desc: '经典四人飞行棋网页版：56 格闭环主航道 + 臂尖入超终点航道，投 6 起飞、同色跳点飞跃、撞击击落、精确到心（反弹）。玩家信息卡与骰子全部画进棋盘四角机库（轮到谁，骰子就在谁的机库里转），支持 1-2 名真人同页轮流操作，其余座位由启发式 AI 电脑接管。',
+    tags: ['桌游', '同屏多人', 'AI 电脑', '棋盘内嵌 UI', '零依赖', '回合制'],
+    tech: '原生 Canvas 2D + Web Audio 合成音效 · 单文件 index.html · 无任何外部请求',
+    control: '真人回合点击己方机库中的骰子掷骰（或按空格）；多架可动时点击棋盘上闪烁的飞机选择',
+    score: '4 架飞机全部抵达中心即获胜；投 6 / 击落对手可获得重掷机会；连掷三个 6 本回合作废',
+    docs: 'README.md（含棋盘几何模型、AI 策略、node _test.js 无头回归测试）',
+    thumb: ['#a8d8ff', '#3867d6'],
+    accent: '#3867d6',
+    requiresServer: false
+  },
+  {
     dir: 'jump-block-m3',
     name: '跳一跳 3D',
     sub: 'JUMP · Three.js',
