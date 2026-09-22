@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>跳跃方块 · Jump Block</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: #dfeaf2; }
+  #stage { position: fixed; inset: 0; touch-action: none; -webkit-user-select: none; user-select: none; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .hud { position: absolute; pointer-events: none; color: #34495e; text-align: center; left: 0; right: 0; }
+  #score { top: 4.5vh; font-size: clamp(40px, 9vh, 72px); font-weight: 800; color: #2c3e50; text-shadow: 0 2px 0 rgba(255,255,255,.6); }
+  #best  { top: calc(4.5vh + clamp(52px, 11vh, 86px)); font-size: 14px; letter-spacing: 2px; color: #7f8c9b; }
+  #combo { top: calc(4.5vh + clamp(84px, 16vh, 120px)); font-size: 15px; font-weight: 700; color: #e67e22; opacity: 0; transition: opacity .3s; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+             background: rgba(240,246,250,.55); backdrop-filter: blur(2px); transition: opacity .35s; }
+  .overlay.gone { opacity: 0; pointer-events: none; }
+  .panel { background: #fff; border-radius: 22px; padding: 34px 44px; text-align: center;
+           box-shadow: 0 18px 50px rgba(44,62,80,.18); }
+  .panel h1 { font-size: 26px; color: #2c3e50; margin-bottom: 6px; letter-spacing: 1px; }
+  .panel p { font-size: 14px; color: #8a97a5; line-height: 1.9; }
+  .panel .big { font-size: 46px; font-weight: 800; color: #e67e22; margin: 8px 0 2px; }
+  .panel .tip { margin-top: 18px; font-size: 13px; color: #b0bcc7; }
+  .badge { display:inline-block; margin-top: 10px; padding: 3px 12px; border-radius: 20px; background: #fdf1e3; color: #e67e22; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game"></canvas>
+  <div class="hud" id="score">0</div>
+  <div class="hud" id="best">最佳 0</div>
+  <div class="hud" id="combo"></div>
+
+  <div class="overlay" id="startOverlay">
+    <div class="panel">
+      <h1>跳跃方块</h1>
+      <p>按住屏幕蓄力，松手起跳<br>落在方块中心可触发连续高分<br>跌落即结束</p>
+      <div class="badge">模仿「跳一跳」玩法 · 素材全部原创</div>
+      <p class="tip">点击任意处开始 · 电脑端可用空格键</p>
+    </div>
+  </div>
+
+  <div class="overlay gone" id="overOverlay">
+    <div class="panel">
+      <h1>跌落啦！</h1>
+      <div class="big" id="finalScore">0</div>
+      <p id="finalMsg">再来一次，超越自己</p>
+      <p class="tip">点击任意处重新开始</p>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================
+   跳跃方块 Jump Block —— 伪等距（isometric）跳一跳玩法复刻
+   纯 Canvas 2D 手绘素材，无任何外部资源
+   ============================================================ */
+const cvs = document.getElementById("game");
+const ctx = cvs.getContext("2d");
+const $score = document.getElementById("score");
+const $best  = document.getElementById("best");
+const $combo = document.getElementById("combo");
+const $start = document.getElementById("startOverlay");
+const $over  = document.getElementById("overOverlay");
+const $final = document.getElementById("finalScore");
+const $fmsg  = document.getElementById("finalMsg");
+
+let W = 0, H = 0, DPR = 1, U = 1; // 视口尺寸 / 设备像素比 / 全局缩放
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cvs.width = W * DPR; cvs.height = H * DPR;
+  U = Math.max(0.62, Math.min(1.3, Math.min(W / 460, H / 780)));
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const rand  = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp  = (a, b, t) => a + (b - a) * t;
+
+/* ---------- 数值手感（调这里） ---------- */
+const CHARGE_TIME = 1.15;          // 蓄力起跳延迟（秒），蓄满总时长 = 0.1 + 此值
+const RAMP = 0.1;                  // 起手防误触延迟
+const DIST_MIN = 26, DIST_MAX = 366; // 跳跃距离区间（逻辑像素）
+const GAP_MIN = 132;               // 相邻方块中心距下限
+const PERFECT_R = 0.20;            // 中心判定阈值（归一化）
+
+/* ---------- 音效（WebAudio 合成，零素材） ---------- */
+let AC = null;
+function audio() { if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return AC; }
+function tone(f0, f1, dur, type, vol, delay) {
+  const ac = audio(); if (!ac) return;
+  const t = ac.currentTime + (delay || 0);
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || "sine"; o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t + dur);
+  g.gain.setValueAtTime(vol || 0.15, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(ac.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+const sfx = {
+  charge:  () => tone(160, 240, 0.5, "triangle", 0.05),
+  jump:    () => tone(300, 760, 0.22, "sine", 0.14),
+  land:    () => { tone(190, 90, 0.16, "triangle", 0.2); tone(900, 500, 0.06, "sine", 0.05); },
+  perfect: n => { tone(880, 880, 0.1, "sine", 0.12); tone(1318, 1318, 0.16, "sine", 0.12, 0.09 + n * 0.03); },
+  fail:    () => tone(420, 70, 0.55, "sawtooth", 0.12),
+};
+
+/* ---------- 方块配色（原创柔和色板） ---------- */
+const PALETTE = [
+  ["#8ec5fc", "#6fb3f2", "#5a9fdd"], ["#f9c784", "#f0b264", "#dc9d4f"],
+  ["#a8e6cf", "#7fd6ae", "#63bd94"], ["#fdffb6", "#f2f495", "#dde083"],
+  ["#e2c6f5", "#cba8e8", "#b791d6"], ["#ffb3ba", "#f79aa2", "#e07f88"],
+  ["#b5ead7", "#93dcc0", "#77c7a9"], ["#ffd6a5", "#f5bd87", "#e0a76f"],
+];
+
+/* ---------- 世界状态 ---------- */
+const DIRS = [{ x: 0.866, y: 0.5 }, { x: -0.866, y: 0.5 }]; // 两条等距轴向（屏幕向右下 / 左下）
+let blocks, cur, phase, score, best, streak;
+let char, charge, jump, fall, cam, shake, effects, floats, lastDir, started;
+best = +(localStorage.getItem("jumpblock-best") || 0);
+$best.textContent = "最佳 " + best;
+
+function makeBlock(prev) {
+  let dirIdx;
+  if (!prev) dirIdx = 0;
+  else dirIdx = Math.random() < 0.42 ? prev.dir : 1 - prev.dir; // 允许偶尔同向
+  const dirVec = DIRS[dirIdx];
+  const r = clamp(60 - score * 0.45, 40, 60) * rand(0.9, 1.12);
+  let gap = GAP_MIN + Math.random() * clamp(120 + score * 7, 120, 190);
+  if (prev) gap = Math.max(gap, prev.r * 0.45 + r * 0.45 + 70);
+  gap = clamp(gap, GAP_MIN, DIST_MAX - 46); // 保证够得着
+  const pal = PALETTE[(Math.random() * PALETTE.length) | 0];
+  return {
+    x: prev ? prev.x + dirVec.x * gap : 0,
+    y: prev ? prev.y + dirVec.y * gap : 0,
+    r, h: r * rand(0.85, 1.5), dir: dirIdx, pal, bounce: 0, born: 0,
+  };
+}
+
+function reset() {
+  score = 0; streak = 0; lastDir = 0;
+  blocks = [];
+  const b0 = makeBlock(null); blocks.push(b0);
+  for (let i = 0; i < 4; i++) blocks.push(makeBlock(blocks[blocks.length - 1]));
+  blocks.forEach((b, i) => b.born = i ? -1 : 0); // 首块直接出现
+  cur = 0;
+  char = { x: b0.x, y: b0.y, z: 0, rot: 0, squash: 0 };
+  cam = { x: b0.x, y: b0.y - 40 };
+  effects = []; floats = []; shake = 0;
+  phase = "idle";
+  $score.textContent = "0";
+  $combo.style.opacity = 0;
+}
+
+/* ---------- 落点判定：以方块顶面菱形内接椭圆近似 ---------- */
+function normDist(px, py, b) {
+  const dx = (px - b.x) / b.r, dy = (py - b.y) / (b.r * 0.5);
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function land() {
+  const p = { x: char.x, y: char.y };
+  const b1 = blocks[cur + 1], b2 = blocks[cur + 2];
+  const d1 = normDist(p.x, p.y, b1);
+  const d2 = b2 ? normDist(p.x, p.y, b2) : 9;
+  const d0 = normDist(p.x, p.y, blocks[cur]);
+
+  if (d2 < 1 && d2 <= d1) { // 直接飞过下一个，落在下下个
+    settle(b2, cur + 2); addScore(2, "超远跳 +2"); return;
+  }
+  if (d1 < 1) {
+    if (d1 <= PERFECT_R) {
+      streak++;
+      addScore(1 + streak * 2, streak > 1 ? "完美连击 x" + streak + "（+" + (1 + streak * 2) + "）" : "完美 +3");
+      burst(p.x, p.y, "#ffd166", 14);
+      sfx.perfect(Math.min(streak, 6));
+    } else {
+      streak = 0; addScore(1); burst(p.x, p.y, "#ffffff", 7);
+      sfx.land();
+    }
+    settle(b1, cur + 1);
+    $combo.style.opacity = streak > 1 ? 1 : 0;
+    $combo.textContent = streak > 1 ? "🔥 完美连击 x" + streak : "";
+    return;
+  }
+  if (d0 < 1) { // 力度太小，落回原块
+    streak = 0; $combo.style.opacity = 0;
+    sfx.land(); char.rot = 0; char.squash = 0.5;
+    blocks[cur].bounce = 1;
+    burst(char.x, char.y, "#ffffff", 6);
+    phase = "idle";
+    return;
+  }
+  // 哪都没沾上 → 跌落
+  phase = "falling";
+  fall = { t: 0, vx: (char.x - jump.sx) / jump.T * 0.6, vy: (char.y - jump.sy) / jump.T * 0.6, vz: 2.2 };
+  sfx.fail(); shake = 1;
+}
+
+function settle(b, idx) {
+  cur = idx;
+  char.x = jump.tx; char.y = jump.ty; char.z = 0; char.rot = 0; char.squash = 0.55;
+  b.bounce = 1;
+  // 向前补块
+  while (blocks.length < cur + 5) blocks.push(makeBlock(blocks[blocks.length - 1]));
+  phase = "idle";
+}
+
+function addScore(n, msg) {
+  score += n;
+  $score.textContent = score;
+  if (msg) floats.push({ x: char.x, y: char.y, z: 60, text: msg, t: 0 });
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = rand(30, 120);
+    effects.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v * 0.5, vz: rand(20, 120), z: 0, color, life: rand(0.3, 0.6), t: 0 });
+  }
+}
+
+/* ---------- 输入 ---------- */
+let pressing = false;
+function pressDown() {
+  audio(); if (AC && AC.state === "suspended") AC.resume();
+  if (!started) { started = true; $start.classList.add("gone"); return; }
+  if (phase === "over") { $over.classList.add("gone"); reset(); return; }
+  if (phase !== "idle" || pressing) return;
+  pressing = true;
+  charge = { t: 0, p: 0 };
+  phase = "charging";
+  sfx.charge();
+}
+function pressUp() {
+  if (!pressing) return;
+  pressing = false;
+  if (phase !== "charging") return;
+  const p = clamp(charge.p, 0, 1);
+  char.squash = 0.15;
+  const dist = DIST_MIN + (DIST_MAX - DIST_MIN) * p;
+  const nb = blocks[cur + 1];
+  const dx = nb.x - char.x, dy = nb.y - char.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len;
+  jump = {
+    sx: char.x, sy: char.y, tx: char.x + ux * dist, ty: char.y + uy * dist,
+    T: 0.34 + dist / 950, t: 0, peak: 55 + dist * 0.24,
+  };
+  phase = "flying";
+  sfx.jump();
+}
+const stage = document.getElementById("stage");
+stage.addEventListener("pointerdown", e => { e.preventDefault(); pressDown(); });
+window.addEventListener("pointerup", pressUp);
+window.addEventListener("pointercancel", () => { pressing = false; if (phase === "charging") pressUp(); });
+window.addEventListener("keydown", e => { if (e.code === "Space" && !e.repeat) pressDown(); });
+window.addEventListener("keyup", e => { if (e.code === "Space") pressUp(); });
+window.addEventListener("contextmenu", e => e.preventDefault());
+
+/* ---------- 更新 ---------- */
+let lastT = performance.now();
+function update(dt) {
+  // 摄像机：跟随当前块与目标块中点
+  const nb = blocks[cur + 1] || blocks[cur];
+  const tx = lerp(blocks[cur].x, nb.x, 0.5), ty = lerp(blocks[cur].y, nb.y, 0.5) - 40;
+  cam.x = lerp(cam.x, tx, Math.min(1, dt * 3.2));
+  cam.y = lerp(cam.y, ty, Math.min(1, dt * 3.2));
+  shake = Math.max(0, shake - dt * 2.5);
+  blocks.forEach(b => { b.bounce = Math.max(0, b.bounce - dt * 4); b.born = Math.min(1, b.born + dt * 5); });
+
+  if (phase === "charging") {
+    charge.t += dt;
+    charge.p = clamp((charge.t - RAMP) / CHARGE_TIME, 0, 1);
+    char.squash = lerp(char.squash, 0.42 * charge.p, dt * 18);
+  }
+  if (phase === "flying") {
+    jump.t += dt;
+    const k = clamp(jump.t / jump.T, 0, 1);
+    char.x = lerp(jump.sx, jump.tx, k);
+    char.y = lerp(jump.sy, jump.ty, k);
+    char.z = 4 * jump.peak * k * (1 - k);
+    const flip = clamp(jump.t / (jump.T * 0.72), 0, 1);
+    char.rot = Math.PI * 2 * (1 - Math.pow(1 - flip, 3)); // 缓出翻转
+    if (k >= 1) land();
+  }
+  if (phase === "falling") {
+    fall.t += dt;
+    char.x += fall.vx * dt * 60; char.y += fall.vy * dt * 60;
+    fall.vz += dt * 14; char.z -= fall.vz * dt * 60;
+    char.rot += dt * 7;
+    if (fall.t > 0.95) {
+      phase = "over";
+      if (score > best) { best = score; localStorage.setItem("jumpblock-best", best); }
+      $best.textContent = "最佳 " + best;
+      $final.textContent = score;
+      $fmsg.textContent = score >= best && score > 0 ? "新纪录！太强了" : "再来一次，超越自己";
+      $over.classList.remove("gone");
+    }
+  }
+  // 落地压簧恢复
+  if (phase === "idle") char.squash = lerp(char.squash, 0, dt * 10);
+
+  // 粒子与漂浮文字
+  effects = effects.filter(p => (p.t += dt) < p.life);
+  effects.forEach(p => {
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt; p.vz -= 300 * dt;
+    if (p.z < 0) { p.z = 0; p.vz *= -0.4; }
+  });
+  floats = floats.filter(f => (f.t += dt) < 1.1);
+}
+
+/* ---------- 绘制 ---------- */
+function drawBg() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#e8f1f7"); g.addColorStop(0.6, "#dfe9f0"); g.addColorStop(1, "#d3dfe8");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // 远景装饰圆（视差）
+  ctx.fillStyle = "rgba(255,255,255,.5)";
+  for (let i = 0; i < 6; i++) {
+    const px = ((i * 251 - cam.x * 0.06 * U) % (W + 300) + W + 300) % (W + 300) - 150;
+    const py = ((i * 337 - cam.y * 0.04 * U) % (H + 200) + H + 200) % (H + 200) - 100;
+    ctx.beginPath(); ctx.arc(px, py, 40 + (i % 3) * 26, 0, 7); ctx.fill();
+  }
+}
+
+function diamondPath(x, y, r) {
+  ctx.beginPath();
+  ctx.moveTo(x, y - r * 0.5); ctx.lineTo(x + r, y);
+  ctx.lineTo(x, y + r * 0.5); ctx.lineTo(x - r, y);
+  ctx.closePath();
+}
+
+function drawBlock(b) {
+  const s = 1 - b.bounce * 0.12;              // 落地弹跳
+  const appear = clamp(b.born, 0, 1);         // 出现动画
+  const r = b.r * appear, h = b.h * appear * s;
+  const y = b.y;
+  const [top, right, left] = b.pal;
+  // 左面
+  ctx.fillStyle = left;
+  ctx.beginPath();
+  ctx.moveTo(b.x - r, y); ctx.lineTo(b.x, y + r * 0.5);
+  ctx.lineTo(b.x, y + r * 0.5 + h); ctx.lineTo(b.x - r, y + h);
+  ctx.closePath(); ctx.fill();
+  // 右面
+  ctx.fillStyle = right;
+  ctx.beginPath();
+  ctx.moveTo(b.x, y + r * 0.5); ctx.lineTo(b.x + r, y);
+  ctx.lineTo(b.x + r, y + h); ctx.lineTo(b.x, y + r * 0.5 + h);
+  ctx.closePath(); ctx.fill();
+  // 顶面
+  ctx.fillStyle = top;
+  diamondPath(b.x, y, r); ctx.fill();
+  // 顶面描边与中心点
+  ctx.strokeStyle = "rgba(255,255,255,.65)"; ctx.lineWidth = 1.5;
+  diamondPath(b.x, y, r); ctx.stroke();
+  ctx.fillStyle = "rgba(0,0,0,.07)";
+  ctx.beginPath(); ctx.ellipse(b.x, y, r * 0.32, r * 0.16, 0, 0, 7); ctx.fill();
+}
+
+function drawChar() {
+  const bob = phase === "idle" ? Math.sin(performance.now() / 300) * 1.5 : 0;
+  const sq = char.squash;
+  const x = char.x, y = char.y - char.z - bob;
+  // 影子
+  const sh = clamp(1 - char.z / 260, 0.25, 1);
+  ctx.fillStyle = "rgba(40,60,80," + 0.18 * sh + ")";
+  ctx.beginPath();
+  ctx.ellipse(char.x, char.y + 2, 17 * sh, 8 * sh, 0, 0, 7); ctx.fill();
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(char.rot * (phase === "flying" ? 1 : 0));
+  ctx.scale(1 + sq * 0.3, 1 - sq * 0.4);
+  ctx.translate(0, -22); // 脚底为原点
+  // 身体（胶囊）
+  const bg = ctx.createLinearGradient(-14, -22, 14, 22);
+  bg.addColorStop(0, "#ff9d7e"); bg.addColorStop(1, "#f4623a");
+  ctx.fillStyle = bg;
+  roundRect(-13, -16, 26, 38, 12); ctx.fill();
+  // 肚皮
+  ctx.fillStyle = "rgba(255,255,255,.75)";
+  ctx.beginPath(); ctx.ellipse(0, 8, 7.5, 9, 0, 0, 7); ctx.fill();
+  // 眼睛面罩
+  ctx.fillStyle = "#3b4a5a";
+  roundRect(-9, -10, 18, 8, 4); ctx.fill();
+  ctx.fillStyle = "#7ef3e2";
+  ctx.beginPath(); ctx.arc(-4, -6, 1.8, 0, 7); ctx.arc(4, -6, 1.8, 0, 7); ctx.fill();
+  // 天线
+  ctx.strokeStyle = "#3b4a5a"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, -16); ctx.lineTo(0, -24); ctx.stroke();
+  ctx.fillStyle = "#4ecdc4";
+  ctx.beginPath(); ctx.arc(0, -26, 3.4, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawMeter() {
+  if (phase !== "charging") return;
+  const p = clamp(charge.p, 0, 1);
+  ctx.save();
+  ctx.translate(char.x, char.y);
+  ctx.scale(1, 0.5);
+  ctx.strokeStyle = "rgba(44,62,80,.25)"; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(0, 0, 34, 0, 7); ctx.stroke();
+  ctx.strokeStyle = p < 0.75 ? "#4ecdc4" : "#ff6b6b"; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(0, 0, 34, -Math.PI / 2, -Math.PI / 2 + p * Math.PI * 2); ctx.stroke();
+  ctx.restore();
+}
+
+function drawFx() {
+  effects.forEach(p => {
+    const a = 1 - p.t / p.life;
+    ctx.globalAlpha = a; ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y - p.z, 3.2 * a + 1, 0, 7); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+  floats.forEach(f => {
+    const a = 1 - f.t / 1.1;
+    ctx.globalAlpha = a;
+    ctx.font = "700 16px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e67e22";
+    ctx.strokeStyle = "rgba(255,255,255,.9)"; ctx.lineWidth = 3;
+    ctx.strokeText(f.text, f.x, f.y - f.z - f.t * 40);
+    ctx.fillText(f.text, f.x, f.y - f.z - f.t * 40);
+    ctx.globalAlpha = 1;
+  });
+}
+
+function render() {
+  drawBg();
+  ctx.save();
+  const sx = shake ? rand(-1, 1) * shake * 8 : 0, sy = shake ? rand(-1, 1) * shake * 6 : 0;
+  ctx.translate(W / 2 + sx, H * 0.60 + sy);
+  ctx.scale(U, U);
+  ctx.translate(-cam.x, -cam.y);
+
+  const viewW = W / U, viewH = H / U;
+  blocks.forEach(b => {
+    if (Math.abs(b.x - cam.x) < viewW && Math.abs(b.y - cam.y) < viewH) drawBlock(b);
+  });
+  drawMeter();
+  drawChar();
+  drawFx();
+  ctx.restore();
+}
+
+/* ---------- 主循环 ---------- */
+started = false;
+reset();
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

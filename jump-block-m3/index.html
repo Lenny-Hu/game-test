@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0, viewport-fit=cover" />
+<title>跳一跳 H5 · Three.js</title>
+<style>
+  :root {
+    --ink: #2d3142;
+    --ink-soft: #5a6076;
+    --accent: #ff6b6b;
+    --accent-2: #4ecdc4;
+    --paper: #fef6e4;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink);
+    background: #ffe8d6;
+    touch-action: none;
+  }
+  #app { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  .hud {
+    position: absolute; pointer-events: none;
+    font-weight: 600; letter-spacing: 0.04em;
+    text-shadow: 0 2px 8px rgba(0,0,0,0.18);
+    text-align: center;
+    max-width: 92vw;
+  }
+  #score {
+    top: max(20px, env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%);
+    color: #fff; font-size: clamp(48px, 13vw, 84px); line-height: 1;
+    transition: transform 120ms ease-out;
+  }
+  #best {
+    top: calc(max(20px, env(safe-area-inset-top, 0px)) + clamp(72px, 14vw, 102px));
+    left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.85); font-size: clamp(13px, 2.4vw, 18px);
+  }
+  #combo {
+    top: calc(max(20px, env(safe-area-inset-top, 0px)) + clamp(96px, 19vw, 140px));
+    left: 50%; transform: translateX(-50%);
+    color: var(--accent-2); font-size: clamp(18px, 4vw, 24px);
+    opacity: 0; transition: opacity 200ms;
+    text-shadow: 0 2px 12px rgba(0,0,0,0.35);
+  }
+  #combo.show { opacity: 1; }
+
+  .center-prompt {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px;
+    pointer-events: none;
+    padding: 0 24px;
+    text-align: center;
+  }
+  .center-prompt .title {
+    font-size: clamp(26px, 6.8vw, 52px);
+    color: #fff; font-weight: 700;
+    letter-spacing: 0.06em;
+    text-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    line-height: 1.3;
+    max-width: 92vw;
+  }
+  .center-prompt .sub {
+    font-size: clamp(12px, 3.2vw, 18px);
+    color: rgba(255,255,255,0.92);
+    text-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    line-height: 1.5;
+    max-width: 84vw;
+  }
+
+  .power-wrap {
+    position: absolute; bottom: max(28px, env(safe-area-inset-bottom, 0px)); left: 50%;
+    transform: translateX(-50%);
+    width: min(72vw, 360px); height: 16px;
+    border-radius: 8px; background: rgba(255,255,255,0.3);
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0; transition: opacity 150ms;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+  }
+  .power-wrap.show { opacity: 1; }
+  .power-bar {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, #4ecdc4, #ffe66d, #ff6b6b);
+    border-radius: 8px;
+    transition: width 60ms linear;
+  }
+
+  .btn {
+    position: relative; pointer-events: auto;
+    padding: 12px 22px; border-radius: 999px;
+    background: #fff; color: var(--ink); font-weight: 700;
+    font-size: 16px; letter-spacing: 0.06em;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+    cursor: pointer; border: none;
+    transition: transform 120ms ease-out, box-shadow 120ms;
+  }
+  .btn:hover { transform: translateY(-2px); box-shadow: 0 12px 28px rgba(0,0,0,0.25); }
+  .btn:active { transform: translateY(0); }
+  #restart {
+    position: absolute;
+    top: max(20px, env(safe-area-inset-top, 0px));
+    right: max(16px, env(safe-area-inset-right, 0px));
+    font-size: 14px;
+  }
+  #muteBtn {
+    position: absolute;
+    top: max(20px, env(safe-area-inset-top, 0px));
+    left: max(16px, env(safe-area-inset-left, 0px));
+    width: 40px; height: 40px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+    border-radius: 50%;
+  }
+  #startBtn { font-size: clamp(18px, 4.5vw, 22px); padding: 14px 32px; }
+  #againBtn { font-size: clamp(16px, 4vw, 18px); padding: 14px 30px; margin-top: 6px; }
+
+  .overlay {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    background: rgba(45, 49, 66, 0.55);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    pointer-events: auto;
+  }
+  .overlay.hidden { display: none; }
+  .overlay .panel {
+    background: #fff; border-radius: 24px;
+    padding: clamp(24px, 6vw, 40px) clamp(28px, 7vw, 44px);
+    box-shadow: 0 24px 60px rgba(0,0,0,0.3);
+    text-align: center;
+    min-width: min(280px, 86vw);
+    max-width: 92vw;
+  }
+  .panel h2 {
+    font-size: clamp(24px, 6vw, 32px); margin-bottom: 8px;
+    color: var(--ink);
+  }
+  .panel .result-score {
+    font-size: clamp(44px, 14vw, 64px); font-weight: 800;
+    background: linear-gradient(135deg, #ff6b6b, #4ecdc4);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin: 12px 0;
+  }
+  .panel .result-best {
+    color: var(--ink-soft); font-size: clamp(12px, 3vw, 14px); margin-bottom: 22px;
+  }
+  .panel .hint {
+    color: var(--ink-soft); font-size: clamp(12px, 3vw, 13px); margin-top: 16px; line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+  <div id="app">
+    <!-- HUD -->
+    <div id="score" class="hud">0</div>
+    <div id="best" class="hud">BEST 0</div>
+    <div id="combo" class="hud">+1 COMBO</div>
+
+    <div class="center-prompt" id="centerPrompt">
+      <div class="title" id="promptTitle">按住屏幕蓄力 · 松开起跳</div>
+      <div class="sub" id="promptSub">长按时间决定跳跃距离 · 瞄准下一个方块</div>
+    </div>
+
+    <div class="power-wrap" id="powerWrap"><div class="power-bar" id="powerBar"></div></div>
+
+    <button class="btn" id="restart" style="display:none">重新开始</button>
+    <button class="btn icon" id="muteBtn" aria-label="静音">🔊</button>
+
+    <!-- Start overlay -->
+    <div class="overlay" id="startOverlay">
+      <div class="panel">
+        <h2>跳一跳</h2>
+        <p class="result-best">H5 · Three.js · 长按蓄力挑战</p>
+        <button class="btn" id="startBtn">开始游戏</button>
+        <p class="hint">桌面：鼠标长按 · 移动端：手指长按<br/>中心命中得分更高 · 连续命中触发 COMBO</p>
+      </div>
+    </div>
+
+    <!-- Game over overlay -->
+    <div class="overlay hidden" id="overOverlay">
+      <div class="panel">
+        <h2>本次得分</h2>
+        <div class="result-score" id="finalScore">0</div>
+        <p class="result-best">历史最佳：<span id="finalBest">0</span></p>
+        <button class="btn" id="againBtn">再来一局</button>
+      </div>
+    </div>
+  </div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ============ Deterministic seeded RNG ============
+function mulberry32(seed) {
+  return function () {
+    let t = (seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+let rng = mulberry32(20260524);
+const rand = (min, max) => min + (max - min) * rng();
+
+// ============ Three.js bootstrap ============
+const app = document.getElementById('app');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#ffd6a5');
+scene.fog = new THREE.Fog('#ffd6a5', 18, 60);
+
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 200);
+// cameraOffset is scaled to fit the viewport on resize
+const cameraOffset = new THREE.Vector3(6, 7, 8);
+const cameraTarget = new THREE.Vector3();
+
+// Adaptive framing: pull the camera back on narrow viewports so the next block stays in view,
+// and slightly widen FOV when the screen aspect is very tall (mobile portrait).
+function computeCameraFit() {
+  const aspect = window.innerWidth / window.innerHeight;
+  // distance factor: more distance on tall narrow screens
+  const distFactor = Math.max(1.0, Math.min(1.6, 1.55 - aspect * 0.45));
+  cameraOffset.set(6 * distFactor, 7 * distFactor, 8 * distFactor);
+  // fov bump for very tall aspects (mobile portrait)
+  const tallness = Math.max(1, Math.min(1.2, aspect < 0.7 ? 1 + (0.7 - aspect) * 0.3 : 1));
+  camera.fov = 40 * tallness;
+  camera.updateProjectionMatrix();
+}
+computeCameraFit();
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+app.appendChild(renderer.domElement);
+
+// ============ Lighting ============
+const hemi = new THREE.HemisphereLight('#fff5e1', '#b8c0d6', 0.65);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight('#fff5e1', 1.1);
+sun.position.set(8, 14, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 40;
+sun.shadow.camera.left = -12;
+sun.shadow.camera.right = 12;
+sun.shadow.camera.top = 12;
+sun.shadow.camera.bottom = -12;
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+
+const rim = new THREE.DirectionalLight('#a3c9ff', 0.35);
+rim.position.set(-6, 4, -8);
+scene.add(rim);
+
+// ============ Ground plane (subtle) ============
+{
+  const geo = new THREE.PlaneGeometry(200, 200);
+  const mat = new THREE.MeshStandardMaterial({ color: '#ffd6a5', roughness: 1, metalness: 0 });
+  const m = new THREE.Mesh(geo, mat);
+  m.rotation.x = -Math.PI / 2;
+  m.position.y = -8;
+  m.receiveShadow = true;
+  scene.add(m);
+}
+
+// ============ Blocks (the platforms) ============
+const BLOCK_HEIGHT = 1.2;
+const BASE_SIZE = 1.8;
+
+const palette = [
+  { top: '#ffadad', side: '#ff6b6b' },
+  { top: '#ffd6a5', side: '#f4a261' },
+  { top: '#fdffb6', side: '#e9c46a' },
+  { top: '#caffbf', side: '#52b788' },
+  { top: '#9bf6ff', side: '#4ecdc4' },
+  { top: '#a0c4ff', side: '#5a7bd6' },
+  { top: '#bdb2ff', side: '#7a5cc7' },
+  { top: '#ffc6ff', side: '#d96bb0' },
+];
+
+const blocks = []; // each: { mesh, top, right, forward, size }
+const blockGroup = new THREE.Group();
+scene.add(blockGroup);
+
+function makeBlock(size, paletteIdx) {
+  const c = palette[paletteIdx % palette.length];
+  const g = new THREE.BoxGeometry(size, BLOCK_HEIGHT, size);
+  const matTop = new THREE.MeshStandardMaterial({ color: c.top, roughness: 0.55, metalness: 0.05 });
+  const matSide = new THREE.MeshStandardMaterial({ color: c.side, roughness: 0.7, metalness: 0.05 });
+  // top: index 2, sides: 0,1,3,4, bottom: 5
+  const materials = [matSide, matSide, matTop, matSide, matSide, matSide];
+  const m = new THREE.Mesh(g, materials);
+  m.castShadow = true;
+  m.receiveShadow = true;
+
+  // add a soft accent ring on top
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(size * 0.18, size * 0.28, 32),
+    new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.35, side: THREE.DoubleSide })
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = BLOCK_HEIGHT / 2 + 0.001;
+  m.add(ring);
+  m.userData.ring = ring;
+
+  return m;
+}
+
+function spawnInitialBlocks() {
+  // first block under player
+  const first = makeBlock(BASE_SIZE, 0);
+  first.position.set(0, 0, 0);
+  blockGroup.add(first);
+  blocks.push({ mesh: first, size: BASE_SIZE, colorIdx: 0 });
+
+  // a few ahead
+  for (let i = 1; i < 3; i++) spawnNext();
+}
+
+function spawnNext() {
+  const prev = blocks[blocks.length - 1];
+  const size = Math.max(0.9, Math.min(2.0, prev.size + rand(-0.35, 0.35)));
+  const distance = rand(1.6, 2.6);
+  // random direction in XZ
+  const angle = rand(-Math.PI * 0.35, Math.PI * 0.35); // mostly forward
+  const dir = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle)).normalize();
+  const pos = prev.mesh.position.clone().add(dir.multiplyScalar(distance + prev.size / 2 + size / 2));
+  pos.y = 0;
+
+  const idx = blocks.length;
+  const m = makeBlock(size, idx);
+  m.position.copy(pos);
+  blockGroup.add(m);
+  blocks.push({ mesh: m, size, colorIdx: idx });
+}
+
+// ============ Player (a cube "hero") ============
+const playerGroup = new THREE.Group();
+const player = new THREE.Mesh(
+  new THREE.BoxGeometry(0.9, 0.9, 0.9),
+  new THREE.MeshStandardMaterial({ color: '#fef6e4', roughness: 0.45, metalness: 0.1 })
+);
+player.castShadow = true;
+player.position.y = 0.45;
+playerGroup.add(player);
+
+// eyes
+const eyeMat = new THREE.MeshBasicMaterial({ color: '#2d3142' });
+const eyeGeo = new THREE.SphereGeometry(0.06, 16, 16);
+const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+eyeL.position.set(-0.18, 0.1, 0.45);
+eyeR.position.set(0.18, 0.1, 0.45);
+player.add(eyeL, eyeR);
+
+// cheek blush
+const blushMat = new THREE.MeshBasicMaterial({ color: '#ff8fab', transparent: true, opacity: 0.75 });
+const blushGeo = new THREE.CircleGeometry(0.08, 16);
+const blushL = new THREE.Mesh(blushGeo, blushMat);
+const blushR = new THREE.Mesh(blushGeo, blushMat);
+blushL.position.set(-0.25, -0.05, 0.46);
+blushR.position.set(0.25, -0.05, 0.46);
+player.add(blushL, blushR);
+
+scene.add(playerGroup);
+
+// squash & stretch helper
+const basePlayerScale = new THREE.Vector3(1, 1, 1);
+let squashAnim = null;
+function playSquash(factorY = 0.6, factorXZ = 1.3, duration = 140) {
+  squashAnim = { t: 0, dur: duration, fy: factorY, fxz: factorXZ };
+}
+
+// ============ Audio (procedural, Web Audio API) ============
+// All sounds are synthesized — no asset files, no network. AudioContext is created
+// lazily on the first user gesture (start button click) per browser autoplay rules.
+const audio = {
+  ctx: null,
+  master: null,
+  muted: false,
+  chargeOsc: null,
+  chargeGain: null,
+};
+function ensureAudio() {
+  if (audio.ctx) return;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  audio.ctx = new Ctx();
+  audio.master = audio.ctx.createGain();
+  audio.master.gain.value = 0.55;
+  audio.master.connect(audio.ctx.destination);
+}
+function unlockAudio() {
+  ensureAudio();
+  if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+}
+function setMute(m) {
+  audio.muted = m;
+  if (audio.master) audio.master.gain.value = m ? 0 : 0.55;
+}
+
+// --- one-shot SFX helpers ---
+// envelope shape: (attack, decay, sustain, release) in seconds
+function playEnvTone(freq, type, dur, peak = 0.4, detune = 0) {
+  if (!audio.ctx || audio.muted) return;
+  const t0 = audio.ctx.currentTime;
+  const osc = audio.ctx.createOscillator();
+  const g = audio.ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  osc.detune.value = detune;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.008);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g);
+  g.connect(audio.master);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.05);
+}
+
+function playNoiseBurst(dur, peak = 0.3, lp = 1200) {
+  if (!audio.ctx || audio.muted) return;
+  const t0 = audio.ctx.currentTime;
+  const bufSize = Math.floor(audio.ctx.sampleRate * dur);
+  const buf = audio.ctx.createBuffer(1, bufSize, audio.ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufSize; i++) {
+    // brown-ish noise: random walk for a softer thud
+    const r = (Math.random() * 2 - 1);
+    data[i] = i === 0 ? r : (data[i - 1] + 0.05 * r) * 0.95;
+  }
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  const filter = audio.ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = lp;
+  const g = audio.ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  src.connect(filter);
+  filter.connect(g);
+  g.connect(audio.master);
+  src.start(t0);
+}
+
+// --- continuous charge loop ---
+function startChargeSound() {
+  if (!audio.ctx || audio.muted) return;
+  stopChargeSound();
+  const t0 = audio.ctx.currentTime;
+  audio.chargeOsc = audio.ctx.createOscillator();
+  audio.chargeOsc.type = 'sine';
+  audio.chargeOsc.frequency.setValueAtTime(180, t0);
+  audio.chargeGain = audio.ctx.createGain();
+  audio.chargeGain.gain.setValueAtTime(0.0001, t0);
+  audio.chargeGain.gain.exponentialRampToValueAtTime(0.18, t0 + 0.05);
+  // a soft second oscillator a perfect fifth up for arcade feel
+  const osc2 = audio.ctx.createOscillator();
+  osc2.type = 'triangle';
+  osc2.frequency.setValueAtTime(270, t0);
+  const g2 = audio.ctx.createGain();
+  g2.gain.setValueAtTime(0.0001, t0);
+  g2.gain.exponentialRampToValueAtTime(0.06, t0 + 0.05);
+  audio.chargeOsc.connect(audio.chargeGain);
+  audio.chargeGain.connect(audio.master);
+  osc2.connect(g2);
+  g2.connect(audio.master);
+  audio.chargeOsc._g2 = g2;
+  audio.chargeOsc._osc2 = osc2;
+  audio.chargeOsc.start(t0);
+  osc2.start(t0);
+}
+function updateChargeSound(power) {
+  if (!audio.chargeOsc) return;
+  const t = audio.ctx.currentTime;
+  // ramp base + harmonic with power
+  audio.chargeOsc.frequency.setTargetAtTime(180 + power * 280, t, 0.04);
+  audio.chargeGain.gain.setTargetAtTime(0.08 + power * 0.18, t, 0.04);
+  if (audio.chargeOsc._osc2) {
+    audio.chargeOsc._osc2.frequency.setTargetAtTime(270 + power * 420, t, 0.04);
+    audio.chargeOsc._g2.gain.setTargetAtTime(0.03 + power * 0.09, t, 0.04);
+  }
+}
+function stopChargeSound() {
+  if (!audio.chargeOsc) return;
+  const t = audio.ctx.currentTime;
+  try {
+    audio.chargeGain.gain.cancelScheduledValues(t);
+    audio.chargeGain.gain.setValueAtTime(audio.chargeGain.gain.value, t);
+    audio.chargeGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+    audio.chargeOsc.stop(t + 0.1);
+    if (audio.chargeOsc._osc2) {
+      audio.chargeOsc._g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+      audio.chargeOsc._osc2.stop(t + 0.1);
+    }
+  } catch (e) {}
+  audio.chargeOsc = null;
+  audio.chargeGain = null;
+}
+
+// --- the named events the gameplay layer calls ---
+const SFX = {
+  jump(quality) {
+    // quality: 0..1 (power level) — higher power = brighter/higher whoosh
+    if (!audio.ctx || audio.muted) return;
+    const base = 380 + quality * 360;
+    const t0 = audio.ctx.currentTime;
+    const osc = audio.ctx.createOscillator();
+    const g = audio.ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(base, t0);
+    osc.frequency.exponentialRampToValueAtTime(base * 2.4, t0 + 0.18);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.32, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
+    osc.connect(g); g.connect(audio.master);
+    osc.start(t0); osc.stop(t0 + 0.25);
+    // tiny noise sweep for "whoosh"
+    playNoiseBurst(0.18, 0.18, 1800 + quality * 1200);
+  },
+  landPerfect() {
+    if (!audio.ctx || audio.muted) return;
+    playEnvTone(880, 'sine', 0.18, 0.45);
+    setTimeout(() => playEnvTone(1320, 'sine', 0.14, 0.32), 35);
+    setTimeout(() => playEnvTone(1760, 'sine', 0.18, 0.28), 70);
+  },
+  landSafe() {
+    if (!audio.ctx || audio.muted) return;
+    playEnvTone(440, 'sine', 0.12, 0.32);
+    setTimeout(() => playEnvTone(330, 'sine', 0.16, 0.22), 50);
+    playNoiseBurst(0.08, 0.18, 1800);
+  },
+  landShort() {
+    // landed back on the same block (jumped too short)
+    if (!audio.ctx || audio.muted) return;
+    playEnvTone(220, 'square', 0.1, 0.18);
+    playNoiseBurst(0.06, 0.14, 900);
+  },
+  combo(level) {
+    if (!audio.ctx || audio.muted) return;
+    // ascending arpeggio: higher level = higher notes
+    const root = 660 + Math.min(level, 8) * 70;
+    const notes = [root, root * 1.25, root * 1.5, root * 2];
+    notes.forEach((f, i) => {
+      setTimeout(() => playEnvTone(f, 'triangle', 0.16, 0.36 - i * 0.04), i * 55);
+    });
+  },
+  fall() {
+    if (!audio.ctx || audio.muted) return;
+    // descending slide + thud
+    const t0 = audio.ctx.currentTime;
+    const osc = audio.ctx.createOscillator();
+    const g = audio.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(520, t0);
+    osc.frequency.exponentialRampToValueAtTime(80, t0 + 0.7);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.28, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.75);
+    osc.connect(g); g.connect(audio.master);
+    osc.start(t0); osc.stop(t0 + 0.8);
+    setTimeout(() => playNoiseBurst(0.25, 0.35, 600), 500);
+  },
+  gameOver() {
+    if (!audio.ctx || audio.muted) return;
+    const notes = [523, 392, 311, 233]; // C5, G4, Eb4, Bb3 — descending minor
+    notes.forEach((f, i) => {
+      setTimeout(() => playEnvTone(f, 'triangle', 0.32, 0.4 - i * 0.05), i * 160);
+    });
+  },
+  start() {
+    if (!audio.ctx || audio.muted) return;
+    const notes = [523, 659, 784, 1046];
+    notes.forEach((f, i) => {
+      setTimeout(() => playEnvTone(f, 'sine', 0.18, 0.3), i * 60);
+    });
+  },
+};
+
+// ============ State machine ============
+const STATE = {
+  READY: 'ready',     // waiting for press
+  AIMING: 'aiming',   // user holding, charging power
+  JUMPING: 'jumping', // in the air
+  LANDED: 'landed',   // just landed, brief feedback, then back to READY on next block
+  FALLING: 'falling', // missed, falling
+  GAMEOVER: 'gameover',
+};
+let state = STATE.READY;
+let activeBlockIdx = 0;        // which block player is on
+let pressStart = 0;
+let powerLevel = 0;            // 0..1
+let nextTargetBlockIdx = 1;    // candidate (visual hint) – for camera framing we always show the next
+
+let score = 0;
+let combo = 0;
+let best = Number(localStorage.getItem('jumpBest') || 0);
+document.getElementById('best').textContent = `BEST ${best}`;
+document.getElementById('finalBest').textContent = best;
+
+// jump physics
+let jumpFrom = new THREE.Vector3();
+let jumpTo = new THREE.Vector3();
+let jumpT = 0; // 0..1
+let jumpDuration = 600; // ms, scaled by power
+let jumpAxis = new THREE.Vector3(); // horizontal direction
+let jumpPeakY = 2.2; // peak height, scaled by power
+
+function placePlayerOnBlock(idx) {
+  const b = blocks[idx].mesh;
+  playerGroup.position.copy(b.position);
+  playerGroup.position.y = BLOCK_HEIGHT / 2 + 0.45; // top of block + half player
+}
+
+function getBlockTopCenter(idx) {
+  const b = blocks[idx].mesh;
+  return new THREE.Vector3(b.position.x, BLOCK_HEIGHT / 2, b.position.z);
+}
+
+function getBlockTopSurface(idx, sizeFraction = 0.5) {
+  // returns the top center, optionally with a half-size offset for landing accuracy
+  return getBlockTopCenter(idx);
+}
+
+function currentStandingTop() {
+  return getBlockTopCenter(activeBlockIdx);
+}
+
+// ============ Camera control ============
+// Camera target sits between the current and next block, so the next block is always in frame
+// even when the gap is large or the viewport is narrow.
+const _camFocus = new THREE.Vector3();
+const _camDesPos = new THREE.Vector3();
+function updateCamera(dt) {
+  const cur = blocks[activeBlockIdx].mesh.position;
+  const nxt = blocks[activeBlockIdx + 1] ? blocks[activeBlockIdx + 1].mesh.position : cur;
+  // midpoint, raised slightly so the look-down angle is consistent
+  _camFocus.set((cur.x + nxt.x) * 0.5, (cur.y + nxt.y) * 0.5 + 0.6, (cur.z + nxt.z) * 0.5);
+  cameraTarget.lerp(_camFocus, 0.08);
+
+  _camDesPos.set(
+    cameraTarget.x + cameraOffset.x,
+    cameraTarget.y + cameraOffset.y,
+    cameraTarget.z + cameraOffset.z
+  );
+  camera.position.lerp(_camDesPos, 0.08);
+  camera.lookAt(cameraTarget.x, cameraTarget.y, cameraTarget.z);
+}
+
+// ============ Aim hint (arrow / shadow) ============
+// The arrow group is built so its TIP points along local +X.
+// We rotate it to lie flat on the ground (XZ plane) by orienting +X to the jump direction.
+const aimArrow = new THREE.Group();
+{
+  const cone = new THREE.Mesh(
+    new THREE.ConeGeometry(0.18, 0.55, 16),
+    new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9 })
+  );
+  // Cone default points +Y; rotate so tip points +X
+  cone.rotation.z = -Math.PI / 2;
+  cone.position.x = 0.45;
+  const stem = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.06, 0.06, 0.35, 12),
+    new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9 })
+  );
+  stem.rotation.z = Math.PI / 2;
+  stem.position.x = 0.1;
+  aimArrow.add(cone, stem);
+  aimArrow.visible = false;
+}
+scene.add(aimArrow);
+
+// dynamic shadow disk
+const shadowDisk = new THREE.Mesh(
+  new THREE.CircleGeometry(0.5, 24),
+  new THREE.MeshBasicMaterial({ color: '#2d3142', transparent: true, opacity: 0.22 })
+);
+shadowDisk.rotation.x = -Math.PI / 2;
+shadowDisk.position.y = BLOCK_HEIGHT / 2 + 0.005;
+scene.add(shadowDisk);
+
+// ============ Particle system (landing puff) ============
+const particles = [];
+function spawnLandingPuff(pos, color = '#ffffff') {
+  const count = 14;
+  for (let i = 0; i < count; i++) {
+    const g = new THREE.SphereGeometry(0.06, 6, 6);
+    const m = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 });
+    const mesh = new THREE.Mesh(g, m);
+    mesh.position.copy(pos);
+    const angle = rng() * Math.PI * 2;
+    const speed = rand(0.8, 2.2);
+    const vel = new THREE.Vector3(Math.cos(angle) * speed, rand(0.5, 1.6), Math.sin(angle) * speed);
+    scene.add(mesh);
+    particles.push({ mesh, vel, life: 0, maxLife: 0.5 });
+  }
+}
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life += dt;
+    p.mesh.position.addScaledVector(p.vel, dt);
+    p.vel.y -= 6 * dt;
+    p.mesh.material.opacity = Math.max(0, 0.9 * (1 - p.life / p.maxLife));
+    if (p.life >= p.maxLife) {
+      scene.remove(p.mesh);
+      p.mesh.geometry.dispose();
+      p.mesh.material.dispose();
+      particles.splice(i, 1);
+    }
+  }
+}
+
+// ============ HUD refs ============
+const scoreEl = document.getElementById('score');
+const bestEl = document.getElementById('best');
+const comboEl = document.getElementById('combo');
+const powerBarEl = document.getElementById('powerBar');
+const powerWrapEl = document.getElementById('powerWrap');
+const centerPrompt = document.getElementById('centerPrompt');
+const promptTitle = document.getElementById('promptTitle');
+const promptSub = document.getElementById('promptSub');
+const startOverlay = document.getElementById('startOverlay');
+const overOverlay = document.getElementById('overOverlay');
+const finalScoreEl = document.getElementById('finalScore');
+const finalBestEl = document.getElementById('finalBest');
+const restartBtn = document.getElementById('restart');
+const startBtn = document.getElementById('startBtn');
+const againBtn = document.getElementById('againBtn');
+
+function updateScoreUI() {
+  scoreEl.textContent = score;
+  bestEl.textContent = `BEST ${best}`;
+}
+
+function pulseScale(scale = 1.25, duration = 120) {
+  scoreEl.style.transform = `translateX(-50%) scale(${scale})`;
+  setTimeout(() => { scoreEl.style.transform = 'translateX(-50%) scale(1)'; }, duration);
+}
+// backwards-compatible wrapper — used by non-combo events that just want a small pulse
+const pulseScore = () => pulseScale(1.25, 120);
+function showCombo(text) {
+  comboEl.textContent = text;
+  comboEl.classList.add('show');
+  setTimeout(() => comboEl.classList.remove('show'), 1100);
+}
+
+// ============ Input ============
+function pressStart_() {
+  if (state !== STATE.READY) return;
+  state = STATE.AIMING;
+  pressStart = performance.now();
+  powerLevel = 0;
+  powerWrapEl.classList.add('show');
+  centerPrompt.style.display = 'none';
+  aimArrow.visible = true;
+  startChargeSound();
+}
+function pressEnd_() {
+  if (state !== STATE.AIMING) return;
+  powerLevel = Math.max(0.05, Math.min(1, powerLevel));
+  powerWrapEl.classList.remove('show');
+  aimArrow.visible = false;
+  stopChargeSound();
+  SFX.jump(powerLevel);
+  startJump(powerLevel);
+}
+
+function startJump(power) {
+  // jump origin = the player's CURRENT world position (after settling on a block),
+  // not the block center — so missing-then-correcting your stance actually matters.
+  const fromTop = new THREE.Vector3(
+    playerGroup.position.x,
+    BLOCK_HEIGHT / 2 + 0.45,
+    playerGroup.position.z
+  );
+  const toBlock = blocks[activeBlockIdx + 1];
+  if (!toBlock) {
+    spawnNext();
+  }
+  const target = blocks[activeBlockIdx + 1].mesh.position;
+  const dir = new THREE.Vector3(target.x - fromTop.x, 0, target.z - fromTop.z).normalize();
+
+  // jump distance scaled by power; clamp min/max
+  const maxDist = fromTop.distanceTo(target) * 1.6 + 1.5;
+  const minDist = 0.4;
+  const dist = minDist + power * (maxDist - minDist);
+
+  jumpFrom.copy(fromTop);
+  jumpAxis.copy(dir);
+  jumpTo.copy(jumpFrom).addScaledVector(dir, dist);
+  jumpTo.y = jumpFrom.y;
+  jumpPeakY = 1.2 + power * 3.2;
+  jumpDuration = 480 + (1 - power) * 240;
+  jumpT = 0;
+  state = STATE.JUMPING;
+}
+
+function updateJump(dt) {
+  jumpT += (dt * 1000) / jumpDuration;
+  if (jumpT >= 1) {
+    jumpT = 1;
+    resolveLanding();
+    return;
+  }
+  // horizontal lerp + parabolic Y
+  const px = jumpFrom.x + (jumpTo.x - jumpFrom.x) * jumpT;
+  const pz = jumpFrom.z + (jumpTo.z - jumpFrom.z) * jumpT;
+  const py = jumpFrom.y + (jumpTo.y - jumpFrom.y) * jumpT
+           + Math.sin(jumpT * Math.PI) * jumpPeakY;
+  playerGroup.position.set(px, py, pz);
+
+  // spin mid-air for style
+  player.rotation.y += dt * 6;
+
+  // shadow follows projected XZ
+  shadowDisk.position.set(px, BLOCK_HEIGHT / 2 + 0.01, pz);
+  const shScale = 1 - Math.sin(jumpT * Math.PI) * 0.5;
+  shadowDisk.scale.set(shScale, shScale, 1);
+}
+
+function resolveLanding() {
+  // which block are we over?
+  const px = playerGroup.position.x;
+  const pz = playerGroup.position.z;
+  let landedIdx = -1;
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i];
+    const half = b.size / 2;
+    const dx = Math.abs(px - b.mesh.position.x);
+    const dz = Math.abs(pz - b.mesh.position.z);
+    if (dx <= half && dz <= half) {
+      landedIdx = i;
+      break;
+    }
+  }
+  playerGroup.position.y = BLOCK_HEIGHT / 2 + 0.45;
+
+  if (landedIdx > activeBlockIdx) {
+    // landed on a new block — keep the REAL landing position (no auto-center)
+    activeBlockIdx = landedIdx;
+
+    // soft snap: pull the player a tiny bit toward the block center for visual stability,
+    // but never all the way. This keeps the offset honest so next jump is harder.
+    const block = blocks[landedIdx];
+    const half = block.size / 2;
+    const target = block.mesh.position;
+    const rawOffsetX = px - target.x;
+    const rawOffsetZ = pz - target.z;
+    const rawDist = Math.hypot(rawOffsetX, rawOffsetZ);
+    // pull 25% toward center: leaves 75% of the offset visible
+    const pullFactor = 0.25;
+    const settledX = target.x + rawOffsetX * (1 - pullFactor);
+    const settledZ = target.z + rawOffsetZ * (1 - pullFactor);
+
+    // clamp inside the block so the player can't sit on the rim looking like it's about to fall
+    const settleDist = Math.hypot(settledX - target.x, settledZ - target.z);
+    const maxSettle = half * 0.7;
+    let finalX = settledX, finalZ = settledZ;
+    if (settleDist > maxSettle) {
+      const k = maxSettle / settleDist;
+      finalX = target.x + (settledX - target.x) * k;
+      finalZ = target.z + (settledZ - target.z) * k;
+    }
+    playerGroup.position.set(finalX, BLOCK_HEIGHT / 2 + 0.45, finalZ);
+
+    // accuracy from the ORIGINAL (unsnapped) landing position
+    const distFromCenter = rawDist;
+    const accuracy = 1 - Math.min(1, distFromCenter / half);
+
+    // Scoring rules:
+    //   - landing on any new block awards at least +1 (the base jump)
+    //   - landing in the inner ~25% (accuracy > 0.75) counts as a "center hit" and awards 2^combo points
+    //     combo 1 → +2, combo 2 → +4, combo 3 → +8, combo 4 → +16 …
+    //   - landing near the edge (0.5 < accuracy <= 0.75) still gives +1, but resets the combo multiplier
+    //   - missing the block entirely (no landing → startFalling) resets the combo counter to 0
+    if (accuracy > 0.75) {
+      combo += 1;
+      // exponential reward: 2^combo. Cap at 2^16 to avoid integer overflow on extreme streaks.
+      const reward = Math.min(2 << Math.min(combo - 1, 16), 1 << 16);
+      score += reward;
+      showCombo(`+${reward}${combo > 1 ? `  COMBO x${combo}` : ''}`);
+      SFX.landPerfect();
+      SFX.combo(combo);
+    } else if (accuracy > 0.5) {
+      // safe edge hit: +1 base, no combo bonus, multiplier resets
+      score += 1;
+      showCombo('贴边 +1 · 再稳一点');
+      SFX.landSafe();
+      combo = 0;
+    } else {
+      // very edge but technically on the block: still +1 base, no bonus
+      score += 1;
+      showCombo('+1 · 没到中心');
+      SFX.landSafe();
+      combo = 0;
+    }
+    if (score > best) {
+      best = score;
+      localStorage.setItem('jumpBest', best);
+    }
+    updateScoreUI();
+    // bigger pulse on high-combo rewards
+    if (accuracy > 0.75 && combo >= 3) {
+      pulseScale(1.5, 180);
+    } else {
+      pulseScore();
+    }
+    spawnLandingPuff(new THREE.Vector3(finalX, BLOCK_HEIGHT / 2 + 0.1, finalZ), accuracy > 0.75 ? '#ffffff' : '#ffe66d');
+    playSquash(0.7, 1.25, 140);
+
+    while (activeBlockIdx + 2 >= blocks.length) spawnNext();
+
+    state = STATE.READY;
+    centerPrompt.style.display = 'flex';
+    promptTitle.textContent = '继续 · 按住蓄力';
+    promptSub.textContent = '下次瞄准中心 · 只有正中才触发 COMBO';
+  } else if (landedIdx === activeBlockIdx) {
+    // landed back on the same block (too short): keep real position but no score
+    playerGroup.position.set(px, BLOCK_HEIGHT / 2 + 0.45, pz);
+    spawnLandingPuff(new THREE.Vector3(px, BLOCK_HEIGHT / 2 + 0.1, pz), '#ffe66d');
+    playSquash(0.8, 1.15, 120);
+    SFX.landShort();
+    state = STATE.READY;
+    centerPrompt.style.display = 'flex';
+    promptTitle.textContent = '差一点点！再试一次';
+    promptSub.textContent = '按住更久一点可以跳更远';
+  } else {
+    SFX.fall();
+    startFalling();
+  }
+  shadowDisk.scale.set(1, 1, 1);
+}
+
+function startFalling() {
+  state = STATE.FALLING;
+  centerPrompt.style.display = 'flex';
+  promptTitle.textContent = '哎呀 · 掉下去了';
+  promptSub.textContent = '点击「重新开始」再来一次';
+  finalScoreEl.textContent = score;
+  finalBestEl.textContent = best;
+  restartBtn.style.display = 'none';
+  // play the 4-note game-over motif once the fall settles
+  setTimeout(() => SFX.gameOver(), 600);
+  setTimeout(() => {
+    overOverlay.classList.remove('hidden');
+  }, 900);
+}
+
+function updateFalling(dt) {
+  playerGroup.position.y -= 6 * dt;
+  player.rotation.x += dt * 4;
+  player.rotation.z += dt * 3;
+  shadowDisk.material.opacity = Math.max(0, shadowDisk.material.opacity - dt * 0.5);
+}
+
+// ============ Reset ============
+function resetGame() {
+  // remove existing blocks
+  for (const b of blocks) {
+    blockGroup.remove(b.mesh);
+    b.mesh.geometry.dispose();
+    if (Array.isArray(b.mesh.material)) b.mesh.material.forEach(m => m.dispose());
+    else b.mesh.material.dispose();
+    if (b.mesh.userData.ring) {
+      b.mesh.userData.ring.geometry.dispose();
+      b.mesh.userData.ring.material.dispose();
+    }
+  }
+  blocks.length = 0;
+
+  // clear particles
+  for (const p of particles) {
+    scene.remove(p.mesh);
+    p.mesh.geometry.dispose();
+    p.mesh.material.dispose();
+  }
+  particles.length = 0;
+
+  rng = mulberry32(Date.now() & 0xffffffff);
+  score = 0;
+  combo = 0;
+  spawnInitialBlocks();
+  activeBlockIdx = 0;
+  placePlayerOnBlock(0);
+  player.rotation.set(0, 0, 0);
+  playerGroup.position.y = BLOCK_HEIGHT / 2 + 0.45;
+  shadowDisk.material.opacity = 0.22;
+  shadowDisk.scale.set(1, 1, 1);
+  state = STATE.READY;
+  updateScoreUI();
+  overOverlay.classList.add('hidden');
+  restartBtn.style.display = '';
+  centerPrompt.style.display = 'flex';
+  promptTitle.textContent = '按住屏幕蓄力 · 松开起跳';
+  promptSub.textContent = '长按时间决定跳跃距离 · 瞄准下一个方块';
+}
+
+// ============ Init first scene ============
+spawnInitialBlocks();
+placePlayerOnBlock(0);
+state = STATE.READY;
+
+// ============ Pointer / touch handlers ============
+// We listen on window so a click anywhere on the canvas surface always starts a jump,
+// regardless of which DOM element happens to be on top. Per-element guards skip the
+// overlay/button targets explicitly.
+const onDown = (e) => {
+  const t = e.target;
+  // early-out: any click on a button is handled by that button's own listener
+  if (t && t.tagName === 'BUTTON') return;
+  if (t && t.closest && t.closest('button')) return;
+  // game must be in READY state
+  if (state !== STATE.READY) return;
+  // if start panel is still up, ignore taps anywhere (start button already handled)
+  if (startOverlay && !startOverlay.classList.contains('hidden')) return;
+  // ignore taps on the game-over overlay panel area
+  if (overOverlay && !overOverlay.classList.contains('hidden')) return;
+  // only react to primary button (left mouse / first touch); touch events have button 0 / undefined
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  e.preventDefault();
+  pressStart_();
+};
+const onUp = (e) => {
+  if (state === STATE.AIMING) {
+    if (e && e.preventDefault) e.preventDefault();
+    pressEnd_();
+  }
+};
+window.addEventListener('pointerdown', onDown);
+window.addEventListener('pointerup', onUp);
+window.addEventListener('pointercancel', onUp);
+window.addEventListener('blur', () => { if (state === STATE.AIMING) pressEnd_(); });
+// resume audio context on any user gesture (some browsers require it)
+const resumeAudio = () => { if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume(); };
+window.addEventListener('pointerdown', resumeAudio, { passive: true });
+window.addEventListener('keydown', resumeAudio, { passive: true });
+
+restartBtn.addEventListener('click', (e) => { e.stopPropagation(); unlockAudio(); resetGame(); });
+startBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  unlockAudio();
+  SFX.start();
+  startOverlay.classList.add('hidden');
+  restartBtn.style.display = '';
+});
+againBtn.addEventListener('click', (e) => { e.stopPropagation(); unlockAudio(); SFX.start(); resetGame(); });
+
+const muteBtnEl = document.getElementById('muteBtn');
+muteBtnEl.addEventListener('click', (e) => {
+  e.stopPropagation();
+  unlockAudio();
+  audio.muted = !audio.muted;
+  setMute(audio.muted);
+  muteBtnEl.textContent = audio.muted ? '🔇' : '🔊';
+});
+
+// ============ Resize ============
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  computeCameraFit();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============ Aim arrow update ============
+const _aimDir = new THREE.Vector3();
+const _aimTip = new THREE.Vector3();
+const _aimQuat = new THREE.Quaternion();
+const _aimUp = new THREE.Vector3(0, 1, 0); // local +Y stays world +Y so arrow lies flat
+const _aimX = new THREE.Vector3(1, 0, 0);  // local +X (arrow's tip direction)
+function updateAimArrow() {
+  if (state !== STATE.AIMING) return;
+  const target = blocks[activeBlockIdx + 1] ? blocks[activeBlockIdx + 1].mesh.position : null;
+  if (!target) return;
+  const fromX = playerGroup.position.x;
+  const fromZ = playerGroup.position.z;
+  _aimDir.set(target.x - fromX, 0, target.z - fromZ);
+  if (_aimDir.lengthSq() < 1e-6) return;
+  _aimDir.normalize();
+
+  // place arrow on the current block's top surface, just outside the player, pointing at the next block
+  const offset = 0.8 + powerLevel * 1.4;
+  _aimTip.set(fromX + _aimDir.x * offset, BLOCK_HEIGHT / 2 + 0.02, fromZ + _aimDir.z * offset);
+  aimArrow.position.copy(_aimTip);
+
+  // rotate so local +X aligns with _aimDir, local +Y stays world +Y (arrow lies flat)
+  _aimQuat.setFromUnitVectors(_aimX, _aimDir);
+  aimArrow.quaternion.copy(_aimQuat);
+
+  const s = 0.7 + powerLevel * 0.9;
+  aimArrow.scale.setScalar(s);
+}
+
+// ============ Squash & stretch ============
+function updateSquash(dt) {
+  if (!squashAnim) return;
+  squashAnim.t += (dt * 1000);
+  const k = Math.min(1, squashAnim.t / squashAnim.dur);
+  // ease out: pulse then return
+  const pulse = Math.sin(k * Math.PI);
+  const sy = 1 + (squashAnim.fy - 1) * pulse;
+  const sxz = 1 + (squashAnim.fxz - 1) * pulse;
+  player.scale.set(sxz, sy, sxz);
+  if (k >= 1) {
+    player.scale.set(1, 1, 1);
+    squashAnim = null;
+  }
+}
+
+// ============ Power ramp ============
+function updatePower(dt) {
+  if (state !== STATE.AIMING) return;
+  const held = (performance.now() - pressStart) / 1500; // 1.5s to full
+  powerLevel = Math.min(1, held);
+  powerBarEl.style.width = (powerLevel * 100).toFixed(1) + '%';
+  updateChargeSound(powerLevel);
+}
+
+// ============ Main loop ============
+const clock = new THREE.Clock();
+function loop() {
+  const dt = Math.min(0.05, clock.getDelta());
+
+  updatePower(dt);
+  updateAimArrow();
+
+  if (state === STATE.JUMPING) {
+    updateJump(dt);
+  } else if (state === STATE.FALLING) {
+    updateFalling(dt);
+  } else {
+    // idle: gentle Y bob, XZ stays where it landed
+    playerGroup.position.y = BLOCK_HEIGHT / 2 + 0.45 + Math.sin(performance.now() / 600) * 0.04;
+    // shadow under player
+    shadowDisk.position.set(playerGroup.position.x, BLOCK_HEIGHT / 2 + 0.005, playerGroup.position.z);
+    shadowDisk.scale.set(1, 1, 1);
+    // face the jump direction (toward next block), not the block center
+    const next = blocks[activeBlockIdx + 1] ? blocks[activeBlockIdx + 1].mesh.position : blocks[activeBlockIdx].mesh.position;
+    const ang = Math.atan2(next.x - playerGroup.position.x, next.z - playerGroup.position.z);
+    player.rotation.y += (ang - player.rotation.y) * 0.12;
+  }
+
+  updateSquash(dt);
+  updateParticles(dt);
+  updateCamera(dt);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+loop();
+
+// ============ Test hooks for inspection ============
+window.__JUMP_TEST_HOOKS__ = {
+  setState: (s) => {
+    if (s === 'ready') state = STATE.READY;
+    if (s === 'jumping') startJump(0.6);
+    if (s === 'falling') startFalling();
+  },
+  setPausedForScreenshot: (paused) => {
+    clock.running = !paused;
+  },
+  setSeed: (seed) => { rng = mulberry32(seed); },
+  reset: resetGame,
+  getState: () => ({ state, score, combo, activeBlockIdx, blocks: blocks.length }),
+};
+</script>
+</body>
+</html>
