@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>五子棋 · Gomoku</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: #23222e; touch-action: none; -webkit-user-select: none; user-select: none; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<script>
+'use strict';
+// ================= 常量 =================
+const N = 15;
+const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
+const EMPTY = 0, BLACK = 1, WHITE = 2;
+const V5 = 10000000, V4O = 1000000, V4 = 100000, V3O = 60000, V3J = 50000, V3 = 3000, V2O = 800, V2J = 700, V2 = 150;
+const LEVELS = ['简单', '普通', '困难'];
+const MODES = [
+  { id: 'pvp', label: '双人对战', desc: '两人同屏轮流' },
+  { id: 'pvb', label: '人机·执黑', desc: '你执黑先行' },
+  { id: 'pvw', label: '人机·执白', desc: '电脑执黑先行' },
+  { id: 'ava', label: '电脑演示', desc: 'AI 对战回放' },
+];
+const OTHER = p => 3 - p;
+
+// ================= 规则引擎（纯函数，供无头测试） =================
+function makeBoard() { return new Int8Array(N * N); }
+const gi = (x, y) => y * N + x;
+const inB = (x, y) => x >= 0 && y >= 0 && x < N && y < N;
+
+function checkWinAt(bd, x, y) {
+  const p = bd[gi(x, y)];
+  if (!p) return null;
+  for (const [dx, dy] of DIRS) {
+    const line = [[x, y]];
+    for (const s of [1, -1]) {
+      let cx = x + dx * s, cy = y + dy * s;
+      while (inB(cx, cy) && bd[gi(cx, cy)] === p) {
+        line.push([cx, cy]);
+        cx += dx * s; cy += dy * s;
+      }
+    }
+    if (line.length >= 5) {
+      line.sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+      return { dir: [dx, dy], cells: line };
+    }
+  }
+  return null;
+}
+
+function isFull(bd) {
+  for (let i = 0; i < bd.length; i++) if (!bd[i]) return false;
+  return true;
+}
+
+// 候选点：已有棋子切比雪夫距离 2 内的空位；空盘返回天元
+function genCandidates(bd) {
+  const set = [];
+  const seen = new Uint8Array(N * N);
+  let any = false;
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    if (!bd[gi(x, y)]) continue;
+    any = true;
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (!inB(nx, ny) || bd[gi(nx, ny)] || seen[gi(nx, ny)]) continue;
+      seen[gi(nx, ny)] = 1;
+      set.push([nx, ny]);
+    }
+  }
+  if (!any) set.push([(N - 1) / 2, (N - 1) / 2]);
+  return set;
+}
+
+// 单方向串型打分：以 (x,y) 假设放 p 子后，读取该方向最长相关片段匹配棋型
+function lineScore(bd, x, y, p, dx, dy, easy) {
+  let s = '';
+  for (let k = -4; k <= 4; k++) {
+    if (k === 0) { s += '1'; continue; }
+    const nx = x + dx * k, ny = y + dy * k;
+    if (!inB(nx, ny)) { s += '2'; continue; }
+    const v = bd[gi(nx, ny)];
+    s += v === p ? '1' : v === 0 ? '0' : '2';
+  }
+  const P = easy ? [
+    ['11111', V5], ['011110', V4O], ['211110', V4], ['011112', V4],
+    ['01110', V3], ['211102', V3], ['001100', V2O],
+  ] : [
+    ['11111', V5], ['011110', V4O],
+    ['211110', V4], ['011112', V4], ['11011', V4], ['11101', V4], ['10111', V4],
+    ['011100', V3O], ['001110', V3O], ['010110', V3J], ['011010', V3J],
+    ['211102', V3], ['210112', V3], ['211012', V3],
+    ['01011', V3], ['11010', V3], ['01100', V2O], ['00110', V2O], ['01010', V2J], ['21100', V2], ['00112', V2],
+  ];
+  for (const [pat, v] of P) if (s.includes(pat)) return v;
+  return 0;
+}
+
+// 在 (x,y) 落 p 子的棋型总分（四个方向求和）
+function lineScoreAt(bd, x, y, p, easy) {
+  let s = 0;
+  for (const [dx, dy] of DIRS) s += lineScore(bd, x, y, p, dx, dy, easy);
+  return s;
+}
+
+function candScore(bd, x, y, p, easy) {
+  return lineScoreAt(bd, x, y, p, easy) + 0.85 * lineScoreAt(bd, x, y, OTHER(p), easy);
+}
+
+function bestOf(cands, sc) {
+  let best = null, bv = -1;
+  for (const [x, y] of cands) {
+    const v = sc(x, y);
+    if (v > bv) { bv = v; best = [x, y]; }
+  }
+  if (!best) return { x: -1, y: -1, score: bv };
+  return { x: best[0], y: best[1], score: bv };
+}
+
+// AI 主入口：level 0/1/2
+function aiBestMove(bd, p, level) {
+  const easy = level === 0;
+  const cands = genCandidates(bd);
+  if (!cands.length) return null;
+  const sc = (x, y) => candScore(bd, x, y, p, easy);
+  if (level === 2) {
+    const win = bestOf(cands, (x, y) => lineScoreAt(bd, x, y, p, false) >= V5 ? 1 : 0);
+    if (win.score === 1) return { x: win.x, y: win.y };
+    const blk = bestOf(cands, (x, y) => lineScoreAt(bd, x, y, OTHER(p), false) >= V5 ? 1 : 0);
+    if (blk.score === 1) return { x: blk.x, y: blk.y };
+    const ranked = cands.map(([x, y]) => [x, y, sc(x, y)]).sort((a, b) => b[2] - a[2]);
+    const top = ranked.slice(0, 10);
+    let best = { mv: top[0], val: -Infinity };
+    for (const [x, y] of top) {
+      bd[gi(x, y)] = p;
+      let worst = Infinity;
+      const opp = OTHER(p);
+      if (checkWinAt(bd, x, y)) { worst = -V5 * 10; }
+      else {
+        const rc = genCandidates(bd);
+        const rw = bestOf(rc, (a, b) => (lineScoreAt(bd, a, b, opp, false) >= V5 ? 1 : 0));
+        if (rw.score === 1) worst = -V5;
+        else {
+          const ranked2 = rc.map(([a, b]) => [a, b, lineScoreAt(bd, a, b, opp, false) + 0.85 * lineScoreAt(bd, a, b, p, false)])
+            .sort((m, n) => n[2] - m[2]).slice(0, 6);
+          for (const [a, b] of ranked2) {
+            const val = sc(x, y) - 0.9 * (lineScoreAt(bd, a, b, opp, false) + 0.85 * lineScoreAt(bd, a, b, p, false));
+            if (val < worst) worst = val;
+          }
+          if (worst === Infinity) worst = sc(x, y);
+        }
+      }
+      bd[gi(x, y)] = EMPTY;
+      if (worst > best.val) best = { mv: [x, y], val: worst };
+    }
+    return { x: best.mv[0], y: best.mv[1] };
+  }
+  const m = bestOf(cands, sc);
+  if (level === 1) return { x: m.x, y: m.y };
+  const arr = cands.map(([x, y]) => [x, y, sc(x, y)]).sort((a, b) => b[2] - a[2]);
+  const top5 = arr.slice(0, Math.min(5, arr.length));
+  // 简单档保底：自己能成五必成五，其余时候有 35% 概率在 top5 里随机（会漏防）
+  const pick = arr[0][2] < V5 && Math.random() < 0.35
+    ? top5[Math.floor(Math.random() * top5.length)] : arr[0];
+  return { x: pick[0], y: pick[1] };
+}
+
+// ================= 全局状态 =================
+const st = {
+  bd: makeBoard(),
+  hist: [],
+  turn: BLACK,
+  phase: 'menu',       // menu | play
+  sel: { mode: 'pvb', level: 1 },
+  mode: 'pvb',
+  level: 1,
+  over: null,          // { winner: 0 表示平局, line }
+  winT: 0,
+  status: '',
+  thinking: false,
+  hover: null,
+  anims: [],
+  stats: { b: 0, w: 0, d: 0 },
+  humanIsBlack: true,
+};
+
+// ================= 音效 =================
+let AC = null;
+function snd(freq, dur, type, gain, delay) {
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const t = AC.currentTime + (delay || 0);
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(gain || 0.12, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(AC.destination);
+    o.start(t); o.stop(t + dur + 0.02);
+  } catch (e) { /* 无音频环境降级 */ }
+}
+const sPlace = p => { snd(p === BLACK ? 175 : 225, 0.09, 'triangle', 0.28); snd(900, 0.03, 'square', 0.05); };
+const sWin = () => [523, 659, 784, 1046].forEach((f, i) => snd(f, 0.18, 'sine', 0.16, i * 0.12));
+const sUndo = () => snd(300, 0.08, 'sine', 0.14);
+
+// ================= 画布 / 布局 =================
+let cv, ctx, vw = 0, vh = 0, dpr = 1, portrait = false;
+const L = { S: 20, ox: 0, oy: 0, hdrH: 64, panelX: 0, panelY: 0, panelW: 0 };
+const UI = { hits: [] };
+
+function computeLayout() {
+  portrait = vh >= vw * 1.02;
+  const gap = portrait ? 8 : 14;
+  L.hdrH = portrait ? 62 : 72;
+  UI.rows = [];
+  if (portrait) {
+    const panelH = Math.min(190, vh * 0.26);
+    const maxB = Math.min(vw - 14, vh - L.hdrH - panelH - gap * 2);
+    L.S = maxB / (14 + 1.2);
+    L.ox = (vw - 14 * L.S) / 2;
+    L.oy = L.hdrH + gap + 0.6 * L.S;
+    L.panelX = 12; L.panelW = vw - 24;
+    L.panelY = L.oy + 14 * L.S + 0.6 * L.S + gap;
+  } else {
+    const panelW = Math.min(330, Math.max(250, vw * 0.32));
+    const availW = vw - panelW - 30;
+    const maxB = Math.min(availW, vh - L.hdrH - 26);
+    L.S = maxB / (14 + 1.2);
+    L.ox = (availW - 14 * L.S) / 2 + 10;
+    L.oy = 8 + L.hdrH + 0.6 * L.S;
+    L.panelX = vw - panelW + 4; L.panelW = panelW - 14;
+    L.panelY = 8;
+  }
+}
+
+function btnList() {
+  const b = [{ id: 'undo', label: '悔棋' }, { id: 'restart', label: '重开' }];
+  if (st.mode === 'ava') b.push({ id: 'pause', label: st.paused ? '继续' : '暂停' });
+  b.push({ id: 'level', label: '难度·' + LEVELS[st.level] });
+  b.push({ id: 'menu', label: '菜单' });
+  return b;
+}
+
+// ================= 对局逻辑 =================
+let aiTimer = null;
+const clearTimer = () => { if (aiTimer) { clearTimeout(aiTimer); aiTimer = null; } };
+const isHumanSeat = p =>
+  st.mode === 'pvp' || (st.mode === 'pvb' && p === BLACK) || (st.mode === 'pvw' && p === WHITE);
+
+function loadStats() {
+  try { const s = JSON.parse(localStorage.getItem('gomoku-stats-v1')); if (s) st.stats = s; } catch (e) {}
+}
+function saveStats() {
+  try { localStorage.setItem('gomoku-stats-v1', JSON.stringify(st.stats)); } catch (e) {}
+}
+function bumpStat(w) { st.stats[w === BLACK ? 'b' : w === WHITE ? 'w' : 'd']++; saveStats(); }
+function revertStat(w) { const k = w === BLACK ? 'b' : w === WHITE ? 'w' : 'd'; if (st.stats[k] > 0) st.stats[k]--; saveStats(); }
+
+function setStatus(t) { st.status = t; st.statusT = 2; }
+
+function play(x, y) {
+  if (st.over || st.bd[gi(x, y)]) return;
+  st.bd[gi(x, y)] = st.turn;
+  st.hist.push({ x, y, p: st.turn });
+  st.anims.push({ x, y, t: 0 });
+  sPlace(st.turn);
+  const line = checkWinAt(st.bd, x, y);
+  if (line) {
+    st.over = { winner: st.turn, line }; st.winT = 0;
+    clearTimer(); st.thinking = false;
+    bumpStat(st.turn); sWin();
+    return;
+  }
+  if (isFull(st.bd)) {
+    st.over = { winner: 0 }; st.winT = 0;
+    clearTimer(); st.thinking = false;
+    bumpStat(0); sUndo();
+    return;
+  }
+  st.turn = OTHER(st.turn);
+  scheduleAI();
+}
+
+function scheduleAI() {
+  clearTimer();
+  const aiGo = !isHumanSeat(st.turn);
+  if (st.over || !aiGo || (st.mode === 'ava' && st.paused)) { st.thinking = false; return; }
+  st.thinking = true;
+  aiTimer = setTimeout(() => {
+    aiTimer = null;
+    const mv = aiBestMove(st.bd, st.turn, st.level);
+    st.thinking = false;
+    play(mv.x, mv.y);
+  }, 300 + Math.random() * 280);
+}
+
+function undo() {
+  if (!st.hist.length) return;
+  clearTimer(); st.thinking = false;
+  if (st.over && st.over.winner) revertStat(st.over.winner);
+  st.over = null;
+  const pop = () => { const h = st.hist.pop(); st.bd[gi(h.x, h.y)] = EMPTY; st.turn = h.p; };
+  pop();
+  if ((st.mode === 'pvb' || st.mode === 'pvw') && !isHumanSeat(st.turn) && st.hist.length) pop();
+  sUndo();
+  setStatus('已悔棋');
+  scheduleAI();
+}
+
+function restart() {
+  clearTimer();
+  st.bd = makeBoard(); st.hist = []; st.turn = BLACK;
+  st.over = null; st.winT = 0; st.anims = []; st.thinking = false; st.paused = false;
+  setStatus('新对局 · ' + (st.mode === 'pvp' ? '双人对战' : st.mode === 'ava' ? '电脑演示' : '祝你好运'));
+  scheduleAI();
+}
+
+function openMenu() {
+  clearTimer();
+  st.thinking = false;
+  st.phase = 'menu';
+}
+
+function startGame() {
+  st.mode = st.sel.mode;
+  st.level = st.sel.level;
+  st.paused = false;
+  st.phase = 'play';
+  restart();
+}
+
+function onCellTap(px, py) {
+  if (st.phase !== 'play' || st.over || st.thinking) return;
+  if (!isHumanSeat(st.turn)) return;
+  const x = Math.round((px - L.ox) / L.S), y = Math.round((py - L.oy) / L.S);
+  if (!inB(x, y)) return;
+  const dx = px - (L.ox + x * L.S), dy = py - (L.oy + y * L.S);
+  if (dx * dx + dy * dy > (L.S * 0.62) * (L.S * 0.62)) return;
+  if (st.bd[gi(x, y)]) return;
+  play(x, y);
+}
+
+// ================= 绘制 =================
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+const FONT = (w, s) => ctx.font = w + ' ' + s + 'px "PingFang SC","Microsoft YaHei",sans-serif';
+
+function drawStone(px, py, p, scale, alpha) {
+  const r = L.S * 0.44 * scale;
+  ctx.save();
+  if (alpha != null) ctx.globalAlpha = alpha;
+  ctx.shadowColor = 'rgba(0,0,0,0.45)';
+  ctx.shadowBlur = L.S * 0.22; ctx.shadowOffsetY = L.S * 0.1;
+  const g = ctx.createRadialGradient(px - r * 0.35, py - r * 0.4, r * 0.15, px, py, r);
+  if (p === BLACK) { g.addColorStop(0, '#70707c'); g.addColorStop(0.5, '#2c2c33'); g.addColorStop(1, '#111114'); }
+  else { g.addColorStop(0, '#ffffff'); g.addColorStop(0.7, '#e8e8ee'); g.addColorStop(1, '#b9b9c4'); }
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawBoardFace() {
+  const pad = 0.6 * L.S, bx = L.ox - pad, by = L.oy - pad, bw = 14 * L.S + pad * 2;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 26; ctx.shadowOffsetY = 10;
+  ctx.fillStyle = '#c8964e'; rr(bx, by, bw, bw, L.S * 0.5); ctx.fill();
+  ctx.restore();
+  ctx.save();
+  rr(bx, by, bw, bw, L.S * 0.5); ctx.clip();
+  const g = ctx.createLinearGradient(bx, by, bx + bw, by + bw);
+  g.addColorStop(0, '#ecc27e'); g.addColorStop(0.5, '#dfae67'); g.addColorStop(1, '#cd9a55');
+  ctx.fillStyle = g; ctx.fillRect(bx, by, bw, bw);
+  ctx.strokeStyle = 'rgba(120,70,20,0.07)'; ctx.lineWidth = 1.5;
+  for (let i = 0; i < 26; i++) {
+    const yy = by + bw * (i / 26) + 4;
+    ctx.beginPath();
+    for (let xx = bx; xx <= bx + bw; xx += 14)
+      ctx.lineTo(xx, yy + Math.sin(xx * 0.045 + i * 1.7) * 3.5);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(70,45,15,0.78)';
+  ctx.lineWidth = Math.max(1, L.S * 0.03);
+  for (let i = 0; i < N; i++) {
+    const ax = L.ox + i * L.S, ay = L.oy + i * L.S;
+    ctx.beginPath(); ctx.moveTo(L.ox, ay); ctx.lineTo(L.ox + 14 * L.S, ay); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax, L.oy); ctx.lineTo(ax, L.oy + 14 * L.S); ctx.stroke();
+  }
+  ctx.lineWidth = Math.max(1.5, L.S * 0.05);
+  ctx.strokeRect(L.ox, L.oy, 14 * L.S, 14 * L.S);
+  ctx.fillStyle = '#5a3b12';
+  for (const [sx, sy] of [[3, 3], [11, 3], [3, 11], [11, 11], [7, 7]]) {
+    ctx.beginPath(); ctx.arc(L.ox + sx * L.S, L.oy + sy * L.S, L.S * 0.1, 0, Math.PI * 2); ctx.fill();
+  }
+  // 悬停虚影（仅真人回合）
+  if (st.hover && !st.over && !st.thinking && isHumanSeat(st.turn) && !st.bd[gi(st.hover.x, st.hover.y)]) {
+    drawStone(L.ox + st.hover.x * L.S, L.oy + st.hover.y * L.S, st.turn, 1, 0.45);
+  }
+  // 棋子
+  const animMap = {};
+  for (const a of st.anims) animMap[gi(a.x, a.y)] = a.t;
+  for (let y2 = 0; y2 < N; y2++) for (let x2 = 0; x2 < N; x2++) {
+    const p = st.bd[gi(x2, y2)];
+    if (!p) continue;
+    let sc = 1;
+    const at = animMap[gi(x2, y2)];
+    if (at != null && at < 0.18) {
+      const t = at / 0.18;
+      sc = 1.35 - 0.35 * t * (2 - t); // 回弹收拢
+    }
+    drawStone(L.ox + x2 * L.S, L.oy + y2 * L.S, p, sc);
+  }
+  // 最后一手标记
+  const last = st.hist[st.hist.length - 1];
+  if (last && !st.over) {
+    ctx.fillStyle = last.p === BLACK ? '#ff6b6b' : '#e03131';
+    ctx.beginPath();
+    ctx.arc(L.ox + last.x * L.S, L.oy + last.y * L.S, L.S * 0.12, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 胜利连线
+  if (st.over && st.over.line) {
+    const cs = st.over.line.cells, a = cs[0], b2 = cs[cs.length - 1];
+    const pulse = 0.55 + 0.45 * Math.sin(st.winT * 7);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,214,80,' + (0.65 + 0.3 * pulse) + ')';
+    ctx.lineWidth = L.S * 0.12; ctx.lineCap = 'round';
+    ctx.shadowColor = 'rgba(255,200,60,0.9)'; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(L.ox + a[0] * L.S, L.oy + a[1] * L.S);
+    ctx.lineTo(L.ox + b2[0] * L.S, L.oy + b2[1] * L.S);
+    ctx.stroke();
+    for (const [cx, cy] of cs) {
+      ctx.strokeStyle = 'rgba(255,224,120,' + (0.5 + 0.5 * pulse) + ')';
+      ctx.lineWidth = L.S * 0.07;
+      ctx.beginPath(); ctx.arc(L.ox + cx * L.S, L.oy + cy * L.S, L.S * 0.5, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+  L.bx = bx; L.by = by; L.bw = bw;
+}
+
+function drawHeader() {
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  rr(8, 6, vw - 16, L.hdrH - 8, 14); ctx.fill();
+  FONT('800', portrait ? 18 : 22);
+  ctx.fillStyle = '#f5e9d0'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  drawStone(26 + (portrait ? 4 : 6), 6 + (L.hdrH - 8) / 2, BLACK, portrait ? 0.55 : 0.7);
+  ctx.fillText('五子棋', 26 + (portrait ? 4 : 6) + L.S * 0.85, 6 + (L.hdrH - 8) / 2 + 1);
+  const sub = 'GOMOKU · 15路 · ' + MODES.find(m => m.id === st.mode).label;
+  FONT('600', 10);
+  ctx.fillStyle = 'rgba(245,233,208,0.45)';
+  ctx.fillText(sub, 26 + (portrait ? 4 : 6) + L.S * 0.85 + (portrait ? 54 : 66), 6 + (L.hdrH - 8) / 2 + 1);
+  // 回合胶囊
+  let txt;
+  if (st.over) txt = st.over.winner ? (st.over.winner === BLACK ? '黑方胜！' : '白方胜！') : '平局！';
+  else if (st.thinking) txt = '电脑思考中' + '.'.repeat(1 + Math.floor(performance.now() / 380) % 3);
+  else {
+    const seat = st.turn === BLACK ? '黑' : '白';
+    txt = st.mode === 'pvp' || st.mode === 'ava' ? seat + '方回合'
+      : isHumanSeat(st.turn) ? '轮到你（' + seat + '）' : seat + '方·电脑';
+  }
+  FONT('700', portrait ? 13 : 15);
+  const tw = ctx.measureText(txt).width;
+  const cw = tw + L.S * 1.5, ch = 34, cx2 = vw - 16 - cw, cy2 = 6 + (L.hdrH - 8) / 2 - ch / 2;
+  ctx.fillStyle = st.over ? 'rgba(255,200,60,0.16)' : 'rgba(255,255,255,0.09)';
+  rr(cx2, cy2, cw, ch, 17); ctx.fill();
+  drawStone(cx2 + ch / 2 + 2, cy2 + ch / 2, st.over && st.over.winner ? st.over.winner : st.turn, 0.62);
+  ctx.fillStyle = st.over ? '#ffd766' : '#efe6d4';
+  ctx.fillText(txt, cx2 + ch - 2, cy2 + ch / 2 + 1);
+}
+
+function drawButton(b, disabled) {
+  ctx.save();
+  if (disabled) ctx.globalAlpha = 0.4;
+  ctx.fillStyle = b.bg || '#3b3850';
+  rr(b.x, b.y, b.w, b.h, 10); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1;
+  rr(b.x, b.y, b.w, b.h, 10); ctx.stroke();
+  FONT('700', b.fs || 13);
+  ctx.fillStyle = b.fg || '#efe6d4'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+  ctx.restore();
+  UI.hits.push({ x: b.x, y: b.y, w: b.w, h: b.h, id: b.id });
+}
+
+function drawPanel() {
+  UI.hits = [];
+  const btns = btnList();
+  const info = [
+    '已下 ' + st.hist.length + ' 手',
+    '战绩  黑 ' + st.stats.b + ' 胜 · 白 ' + st.stats.w + ' 胜 · 平 ' + st.stats.d,
+  ];
+  if (st.status && st.statusT > 0) info.push(st.status);
+  info.push('无禁手 · 先连成五子者胜');
+  if (portrait) {
+    const n = btns.length, bw = (vw - 24 - (n - 1) * 8) / n, bh = 40;
+    let y = L.panelY;
+    btns.forEach((b, i) => {
+      const it = { ...b, x: 12 + i * (bw + 8), y, w: bw, h: bh };
+      if (b.id === 'level') it.bg = '#2f4a63';
+      if (b.id === 'mode') it.bg = '#4a3a5e';
+      drawButton(it, b.id === 'undo' && !st.hist.length);
+    });
+    y += bh + 10;
+    FONT('500', 12); ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    for (const t of info) {
+      ctx.fillStyle = 'rgba(240,230,210,0.55)';
+      ctx.fillText(t, vw / 2, y); y += 18;
+    }
+  } else {
+    const px = L.panelX, pw = L.panelW;
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    rr(px - 6, L.panelY + L.hdrH, pw + 12, vh - L.hdrH - 16, 16); ctx.fill();
+    let y = L.panelY + L.hdrH + 14;
+    const bw = (pw - 10) / 2, bh = 40;
+    btns.forEach((b, i) => {
+      const col = i % 2, row = Math.floor(i / 2);
+      const it = { ...b, x: px + col * (bw + 10), y: y + row * (bh + 10), w: bw, h: bh };
+      if (b.id === 'level') it.bg = '#2f4a63';
+      if (b.id === 'mode') it.bg = '#4a3a5e';
+      drawButton(it, b.id === 'undo' && !st.hist.length);
+    });
+    y += Math.ceil(btns.length / 2) * (bh + 10) + 8;
+    FONT('500', 13); ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    for (const t of info) {
+      ctx.fillStyle = 'rgba(240,230,210,0.6)';
+      ctx.fillText(t, px + 4, y); y += 24;
+    }
+    y += 4;
+    FONT('500', 11.5); ctx.fillStyle = 'rgba(240,230,210,0.35)';
+    const tips = ['点交叉线交点落子', '悬停预览 · 悔棋不罚手', '电脑演示可暂停观察 AI 博弈'];
+    for (const t of tips) { ctx.fillText(t, px + 4, y); y += 19; }
+  }
+}
+
+function drawOverlay() {
+  const a = Math.min(1, (st.winT - 0.7) / 0.4);
+  ctx.fillStyle = 'rgba(20,18,28,' + 0.62 * a + ')';
+  ctx.fillRect(0, 0, vw, vh);
+  ctx.save(); ctx.globalAlpha = a;
+  const cy = vh / 2 - 30;
+  FONT('800', Math.min(44, vw * 0.09));
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffd766';
+  ctx.shadowColor = 'rgba(255,190,60,0.6)'; ctx.shadowBlur = 24;
+  ctx.fillText(st.over.winner ? (st.over.winner === BLACK ? '黑 方 胜 ' : '白 方 胜 ') : '平 局', vw / 2, cy);
+  ctx.shadowBlur = 0;
+  FONT('500', 14); ctx.fillStyle = 'rgba(240,230,210,0.7)';
+  const subTxt = st.mode === 'ava' ? '电脑演示 · ' + LEVELS[st.level] + '棋力'
+    : st.over.winner && isHumanSeat(st.over.winner) ? '你赢了！' : st.over.winner ? '电脑获胜' : '棋盘已满';
+  ctx.fillText(subTxt, vw / 2, cy + 40);
+  const bw = 140, bh = 46, by = cy + 68, gap = 14;
+  let bx = vw / 2 - bw - gap / 2;
+  const g = ctx.createLinearGradient(bx, by, bx + bw, by + bh);
+  g.addColorStop(0, '#e8b45a'); g.addColorStop(1, '#c8862e');
+  ctx.fillStyle = g; rr(bx, by, bw, bh, 23); ctx.fill();
+  FONT('700', 16); ctx.fillStyle = '#2d2416';
+  ctx.fillText('再来一局', bx + bw / 2, by + bh / 2 + 1);
+  UI.hits.push({ x: bx, y: by, w: bw, h: bh, id: 'restart' });
+  bx = vw / 2 + gap / 2;
+  ctx.fillStyle = 'rgba(255,255,255,0.1)'; rr(bx, by, bw, bh, 23); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.2; rr(bx, by, bw, bh, 23); ctx.stroke();
+  ctx.fillStyle = '#efe6d4';
+  ctx.fillText('菜 单', bx + bw / 2, by + bh / 2 + 1);
+  UI.hits.push({ x: bx, y: by, w: bw, h: bh, id: 'menu' });
+  ctx.restore();
+}
+
+function drawMenu() {
+  UI.hits = [];
+  const mw = Math.min(440, vw - 24), mx = (vw - mw) / 2;
+  let y = Math.max(24, vh * 0.07);
+  // 标题
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const ts = Math.min(40, mw * 0.1);
+  FONT('800', ts);
+  const tw = ctx.measureText('五子棋').width;
+  drawStone(mx + mw / 2 - tw / 2 - ts * 0.75, y + 2, BLACK, 0.75);
+  ctx.fillStyle = '#f5e9d0';
+  ctx.fillText('五子棋', mx + mw / 2 + ts * 0.3, y);
+  y += ts * 0.8;
+  FONT('600', 11); ctx.fillStyle = 'rgba(245,233,208,0.4)';
+  ctx.fillText('GOMOKU · 15 路 · 无禁手 · 先连成五子者胜', mx + mw / 2, y + 8);
+  y += 34;
+  // 模式区
+  const sec = (t) => {
+    FONT('700', 13); ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(240,230,210,0.65)';
+    ctx.fillText(t, mx + 4, y); y += 22;
+  };
+  sec('游戏模式');
+  const bw = (mw - 10) / 2, bh = 52;
+  MODES.forEach((m, i) => {
+    const bx = mx + (i % 2) * (bw + 10), by = y + Math.floor(i / 2) * (bh + 8);
+    const on = st.sel.mode === m.id;
+    ctx.fillStyle = on ? '#5a4a75' : 'rgba(255,255,255,0.07)';
+    rr(bx, by, bw, bh, 12); ctx.fill();
+    if (on) { ctx.strokeStyle = '#e8b45a'; ctx.lineWidth = 1.5; rr(bx, by, bw, bh, 12); ctx.stroke(); }
+    FONT('700', 14); ctx.textAlign = 'center';
+    ctx.fillStyle = on ? '#ffe9b8' : '#d9d2c2';
+    ctx.fillText(m.label, bx + bw / 2, by + 19);
+    FONT('500', 10.5); ctx.fillStyle = 'rgba(217,210,194,0.55)';
+    ctx.fillText(m.desc, bx + bw / 2, by + 37);
+    UI.hits.push({ x: bx, y: by, w: bw, h: bh, id: 'selmode-' + m.id });
+  });
+  y += 2 * bh + 8 + 18;
+  // 难度区
+  const isPvp = st.sel.mode === 'pvp';
+  sec('电脑棋艺' + (isPvp ? '（双人模式不使用）' : ''));
+  ctx.save(); if (isPvp) ctx.globalAlpha = 0.35;
+  const lw = (mw - 16) / 3;
+  LEVELS.forEach((t, i) => {
+    const bx = mx + i * (lw + 8), on = st.sel.level === i;
+    ctx.fillStyle = on ? '#2f4a63' : 'rgba(255,255,255,0.07)';
+    rr(bx, y, lw, 40, 10); ctx.fill();
+    if (on) { ctx.strokeStyle = '#7cc4e8'; ctx.lineWidth = 1.5; rr(bx, y, lw, 40, 10); ctx.stroke(); }
+    FONT('700', 14); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = on ? '#cfeaf8' : '#d9d2c2';
+    ctx.fillText(t, bx + lw / 2, y + 21);
+    if (!isPvp) UI.hits.push({ x: bx, y, w: lw, h: 40, id: 'sellevel-' + i });
+  });
+  ctx.restore();
+  y += 40 + 26;
+  // 开始按钮
+  const sw = Math.min(240, mw * 0.62), sh = 52, sx = mx + (mw - sw) / 2;
+  const g = ctx.createLinearGradient(sx, y, sx + sw, y + sh);
+  g.addColorStop(0, '#e8b45a'); g.addColorStop(1, '#c8862e');
+  ctx.save();
+  ctx.shadowColor = 'rgba(232,180,90,0.45)'; ctx.shadowBlur = 18;
+  ctx.fillStyle = g; rr(sx, y, sw, sh, 26); ctx.fill();
+  ctx.restore();
+  FONT('800', 18); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#2d2416';
+  ctx.fillText('开 始 游 戏', sx + sw / 2, y + sh / 2 + 1);
+  UI.hits.push({ x: sx, y, w: sw, h: sh, id: 'start' });
+  y += sh + 16;
+  FONT('500', 11); ctx.fillStyle = 'rgba(240,230,210,0.35)';
+  const seat = isPvp ? '双人同屏轮流落子'
+    : st.sel.mode === 'ava' ? '两个座位均由电脑接管'
+      : '你执' + (st.sel.mode === 'pvb' ? '黑' : '白') + '，另一座位由电脑接管';
+  ctx.fillText(seat, mx + mw / 2, y);
+  ctx.textBaseline = 'alphabetic';
+}
+
+function draw() {
+  ctx.clearRect(0, 0, vw, vh);
+  const bg = ctx.createRadialGradient(vw / 2, vh * 0.3, 40, vw / 2, vh / 2, Math.max(vw, vh));
+  bg.addColorStop(0, '#332f42'); bg.addColorStop(1, '#1e1b26');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, vw, vh);
+  if (st.phase === 'menu') { drawMenu(); return; }
+  drawHeader();
+  drawBoardFace();
+  drawPanel();
+  if (st.over && st.winT > 0.7) drawOverlay();
+}
+
+// ================= 输入 =================
+function hitTest(x, y) {
+  for (let i = UI.hits.length - 1; i >= 0; i--) {
+    const h = UI.hits[i];
+    if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h.id;
+  }
+  return null;
+}
+function onAction(id) {
+  if (id === 'undo') undo();
+  else if (id === 'restart') restart();
+  else if (id === 'menu') openMenu();
+  else if (id === 'start') startGame();
+  else if (id.startsWith('selmode-')) st.sel.mode = id.slice('selmode-'.length);
+  else if (id.startsWith('sellevel-')) st.sel.level = +id.slice('sellevel-'.length);
+  else if (id === 'level') { st.level = (st.level + 1) % LEVELS.length; setStatus('电脑棋艺：' + LEVELS[st.level]); }
+  else if (id === 'pause') {
+    st.paused = !st.paused;
+    if (!st.paused) scheduleAI(); else { clearTimer(); st.thinking = false; }
+  }
+}
+function evPos(e) {
+  const r = cv.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+
+function frame(ts) {
+  const dt = Math.min(0.05, (ts - (frame.last || ts)) / 1000);
+  frame.last = ts;
+  for (const a of st.anims) a.t += dt;
+  st.anims = st.anims.filter(a => a.t < 0.3);
+  if (st.over) st.winT += dt;
+  if (st.statusT > 0) st.statusT -= dt;
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function init() {
+  cv = document.getElementById('cv');
+  ctx = cv.getContext('2d');
+  const resize = () => {
+    dpr = window.devicePixelRatio || 1;
+    vw = window.innerWidth; vh = window.innerHeight;
+    cv.width = vw * dpr; cv.height = vh * dpr;
+    cv.style.width = vw + 'px'; cv.style.height = vh + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    computeLayout();
+  };
+  window.addEventListener('resize', resize);
+  resize();
+  loadStats();
+  cv.addEventListener('pointerdown', e => {
+    if (AC && AC.state === 'suspended') AC.resume();
+    const [x, y] = evPos(e);
+    const id = hitTest(x, y);
+    if (id) { onAction(id); return; }
+    onCellTap(x, y);
+  });
+  cv.addEventListener('pointermove', e => {
+    const [x, y] = evPos(e);
+    const gx = Math.round((x - L.ox) / L.S), gy = Math.round((y - L.oy) / L.S);
+    st.hover = inB(gx, gy) ? { x: gx, y: gy } : null;
+    const overBtn = !!hitTest(x, y);
+    cv.style.cursor = overBtn ? 'pointer'
+      : (st.phase === 'play' && !st.over && !st.thinking && isHumanSeat(st.turn) && st.hover && !st.bd[gi(st.hover.x, st.hover.y)]) ? 'crosshair' : 'default';
+  });
+  window.addEventListener('keydown', e => {
+    if (st.phase !== 'play') return;
+    if (e.key === 'u' || e.key === 'U') undo();
+    else if (e.key === 'r' || e.key === 'R') restart();
+  });
+  st.phase = 'menu';
+}
+
+/* ----TESTS---- */
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
