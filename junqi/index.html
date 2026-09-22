@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>四国军棋 · Junqi</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #14171a;
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 12px;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none; -webkit-user-select: none;
+  }
+  canvas {
+    max-width: 100%;
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+    aspect-ratio: 1180 / 800;          /* JS 按横/竖屏布局覆写 */
+    border-radius: 18px;
+    box-shadow: 0 22px 70px rgba(0, 0, 0, 0.6);
+    touch-action: manipulation;
+    cursor: default;
+  }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1180" height="800"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   四国军棋（陆战棋）· 单文件 Canvas 2D 实现
+   ─ 座位：4 席逆时针轮转（南→东→北→西），南/北一队 vs 东/西一队；
+     支持 单人（你 + 3 AI）/ 双人同盟 / 双人对家操练 / 电脑自战演示，
+     空位一律由 AI 承担
+   ─ 明棋模式：同屏共享视野，所有棋子兵种可见（暗棋裁判制在单页共享
+     屏幕上无法隐藏信息，故采用明棋）
+   ─ 规则引擎：129 点（4×30 + 中央九宫 9）· 288 条边；公路一步 /
+     铁路直线滑行（含四角弧线并线）/ 工兵铁路任意拐弯 / 行营安全岛 /
+     大本营之子锁定 / 地雷只被工兵挖 / 炸弹同归于尽 / 扛旗全军覆没 /
+     司令阵亡亮旗 / 无子可动出局 / 连续无战损判和
+   ─ 拓扑与规则经 siguozero·siguo-junqi·GwanKei 三套开源实现与
+     JJ·边锋两大平台规则页交叉核实（详见 README）
+   ===================================================================== */
+
+// ---------- 兵种与军衔常量 ----------
+// type: 1..9 为军衔（大数压小数），10 炸弹，11 地雷，12 军旗
+const SIMING = 9, JZHANG = 8, SHIZHANG = 7, LVZHANG = 6, TUANZHANG = 5,
+      YINGZHANG = 4, LIANZHANG = 3, PAIZHANG = 2, GONGBING = 1,
+      ZHADAN = 10, DILEI = 11, JUNQI = 12;
+const PIECE_NAME = ['', '工兵', '排长', '连长', '营长', '团长', '旅长', '师长', '军长', '司令', '炸弹', '地雷', '军旗'];
+// 每方 25 子的标准构成：司令/军长各1，师长~营长各2，连/排/工各3，炸弹2 地雷3 军旗1
+const PIECE_COUNTS = [[SIMING,1],[JZHANG,1],[SHIZHANG,2],[LVZHANG,2],[TUANZHANG,2],
+                      [YINGZHANG,2],[LIANZHANG,3],[PAIZHANG,3],[GONGBING,3],
+                      [ZHADAN,2],[DILEI,3],[JUNQI,1]];
+
+// 棋子编码：0 = 空，否则 side*16 + type
+const mkPiece  = (side, type) => side * 16 + type;
+const pSide    = p => (p >> 4);
+const pType    = p => p & 15;
+
+// 子力价值（AI 用）
+const VAL = [0, 15, 20, 25, 35, 45, 55, 70, 90, 100, 40, 25, 1e9];
+
+// ---------- 阵营（座位）定义 ----------
+// side 0 南(蓝·下) → 1 东(绿·右) → 2 北(黄·上) → 3 西(红·左)，逆时针轮转
+// 0&2 一队（蓝黄）vs 1&3 一队（绿红）
+const SIDE_COLOR = [
+  { base: '#2f6fb2', dark: '#173a5c', light: '#8cc1ef', name: '蓝' },   // 南 下
+  { base: '#3f8f4a', dark: '#1e4a26', light: '#9fdca8', name: '绿' },   // 东 右
+  { base: '#c9a53a', dark: '#6e5413', light: '#f0d98a', name: '黄' },   // 北 上
+  { base: '#b8433c', dark: '#5f1d19', light: '#eda7a1', name: '红' },   // 西 左
+];
+const teamOf = s => s & 1;                          // 0/2 → 队0，1/3 → 队1
+
+// ---------- 战斗结算（裁判规则）----------
+// 返回 [攻方存活?, 守方存活?]；军旗被扛特判在 applyMove，不走本函数
+function combat(att, def) {
+  const a = pType(att), d = pType(def);
+  if (a === ZHADAN || d === ZHADAN) return [false, false];                 // 炸弹与任何子同归
+  if (d === DILEI) return a === GONGBING ? [true, false] : [false, true];  // 工兵挖雷，余者撞雷亡、雷不动
+  if (a === d) return [false, false];                                      // 同级同归
+  return a > d ? [true, false] : [false, true];                            // 大衔吃小衔
+}
+
+// =====================================================================
+// 棋盘拓扑：129 节点 / 288 条无向边
+// 每方 6 排×5 列（r=1 前线 → r=6 后排；c=1..5 为该方视角左→右），
+// 行营 (2,2)(2,4)(3,3)(4,2)(4,4)，大本营 (6,2)(6,4)；中央九宫 (cr,cc)。
+// 网格渲染坐标 gx/gy ∈ 0..16：
+//   南 (5+c, 10+r)；东 (10+r, 11-c)；北 (11-c, 6-r)；西 (6-r, 5+c)；
+//   中央 (4+2cc, 12-2cr)。四角弧线以二次贝塞尔绘制。
+// =====================================================================
+const NODES = [];                 // {s,r,c,kind:0兵站|1行营|2大本营, gx,gy}
+const NEIGH = [];                 // 邻接表 [{to,rail,arc,ctrl}]
+const EDGES = [];                 // 渲染用唯一边 {a,b,rail,ctrl}
+const IDX = {};                   // 's|r,c' -> node id
+function addNode(s, r, c, kind, gx, gy) {
+  const id = NODES.length;
+  NODES.push({ s, r, c, kind, gx, gy });
+  NEIGH.push([]);
+  IDX[s + '|' + r + ',' + c] = id;
+  return id;
+}
+const nd = (s, r, c) => IDX[s + '|' + r + ',' + c];
+let CN = null;                    // 中央九宫 CN(cr,cc)，1-based
+{
+  const C = [];
+  for (let cr = 1; cr <= 3; cr++) for (let cc = 1; cc <= 3; cc++)
+    C[cr * 3 + cc] = addNode(4, cr, cc, 0, 4 + 2 * cc, 12 - 2 * cr);
+  CN = (cr, cc) => C[cr * 3 + cc];
+}
+{
+  const mapper = [
+    (r, c) => [5 + c, 10 + r],   // 南
+    (r, c) => [10 + r, 11 - c],  // 东
+    (r, c) => [11 - c, 6 - r],   // 北
+    (r, c) => [6 - r, 5 + c],    // 西
+  ];
+  for (let s = 0; s < 4; s++) for (let r = 1; r <= 6; r++) for (let c = 1; c <= 5; c++) {
+    const isCamp = (r === 2 && (c === 2 || c === 4)) || (r === 3 && c === 3) || (r === 4 && (c === 2 || c === 4));
+    const isHQ   = r === 6 && (c === 2 || c === 4);
+    const [gx, gy] = mapper[s](r, c);
+    addNode(s, r, c, isCamp ? 1 : (isHQ ? 2 : 0), gx, gy);
+  }
+}
+const EDGE_KEY = {};
+function link(a, b, rail, ctrl) {
+  const k = a < b ? a + '_' + b : b + '_' + a;
+  if (EDGE_KEY[k]) return;
+  EDGE_KEY[k] = true;
+  NEIGH[a].push({ to: b, rail, ctrl: rail && ctrl ? ctrl : null });
+  NEIGH[b].push({ to: a, rail, ctrl: rail && ctrl ? ctrl : null });
+  EDGES.push({ a, b, rail, ctrl: rail && ctrl ? ctrl : null });
+}
+{
+  // 1) 每方横纵线：r=1/r=5 横线为铁路；c=1/c=5 纵列 r1..r4 段为铁路；其余公路
+  for (let s = 0; s < 4; s++) for (let r = 1; r <= 6; r++) for (let c = 1; c <= 5; c++) {
+    if (c < 5) link(nd(s, r, c), nd(s, r, c + 1), r === 1 || r === 5);
+    if (r < 6) link(nd(s, r, c), nd(s, r + 1, c), (c === 1 || c === 5) && r <= 4);
+    // 2) 行营斜线（公路）
+    if (NODES[nd(s, r, c)].kind === 1)
+      for (const [dr, dc] of [[-1,-1],[-1,1],[1,-1],[1,1]]) {
+        const rr = r + dr, cc2 = c + dc;
+        if (rr >= 1 && rr <= 6 && cc2 >= 1 && cc2 <= 5) link(nd(s, r, c), nd(s, rr, cc2), false);
+      }
+  }
+  // 3) 中央九宫：全铁路
+  for (let cr = 1; cr <= 3; cr++) for (let cc = 1; cc <= 3; cc++) {
+    if (cc < 3) link(CN(cr, cc), CN(cr, cc + 1), true);
+    if (cr < 3) link(CN(cr, cc), CN(cr + 1, cc), true);
+  }
+  // 4) 前线 → 中央入口（铁路）：每方前线 1/3/5 列
+  const entries = [
+    [0, [[1, 1, 1], [3, 1, 2], [5, 1, 3]]],          // 南 → cr1
+    [2, [[1, 3, 3], [3, 3, 2], [5, 3, 1]]],          // 北 → cr3
+    [3, [[1, 3, 1], [3, 2, 1], [5, 1, 1]]],          // 西 → cc1
+    [1, [[1, 1, 3], [3, 2, 3], [5, 3, 3]]],          // 东 → cc3
+  ];
+  for (const [s, list] of entries) for (const [c, cr, cc] of list) link(nd(s, 1, c), CN(cr, cc), true);
+  // 5) 四角弧线（铁路，相邻阵营前线端点直连）
+  link(nd(0, 1, 1), nd(3, 1, 5), true, [5, 11]);     // 西南角
+  link(nd(3, 1, 1), nd(2, 1, 5), true, [5, 5]);      // 西北角
+  link(nd(2, 1, 1), nd(1, 1, 5), true, [11, 5]);     // 东北角
+  link(nd(1, 1, 1), nd(0, 1, 5), true, [11, 11]);    // 东南角
+}
+
+// 非工兵铁路滑行 = 沿「直线」滑动：预生成贯通线（4 条跨中央长线 +
+// 10 条本阵横/纵短线 + 4 条角弧并线），两点同线且中间全空即可直达
+const RAIL_LINES = [];
+{
+  const push = list => { if (list.every(n => n !== undefined)) RAIL_LINES.push(list); };
+  // 跨中央贯通线
+  push([nd(2,5,5),nd(2,4,5),nd(2,3,5),nd(2,2,5),nd(2,1,5), CN(3,1),CN(2,1),CN(1,1), nd(0,1,1),nd(0,2,1),nd(0,3,1),nd(0,4,1),nd(0,5,1)]); // x=6
+  push([nd(2,5,1),nd(2,4,1),nd(2,3,1),nd(2,2,1),nd(2,1,1), CN(3,3),CN(2,3),CN(1,3), nd(0,1,5),nd(0,2,5),nd(0,3,5),nd(0,4,5),nd(0,5,5)]); // x=10
+  push([nd(3,5,1),nd(3,4,1),nd(3,3,1),nd(3,2,1),nd(3,1,1), CN(3,1),CN(3,2),CN(3,3), nd(1,1,5),nd(1,2,5),nd(1,3,5),nd(1,4,5),nd(1,5,5)]); // y=6
+  push([nd(3,5,5),nd(3,4,5),nd(3,3,5),nd(3,2,5),nd(3,1,5), CN(1,1),CN(1,2),CN(1,3), nd(1,1,1),nd(1,2,1),nd(1,3,1),nd(1,4,1),nd(1,5,1)]); // y=10
+  // 本阵短线：第 1、5 排横线 + 第 1、5 列纵线（四阵营）
+  for (const s of [0, 1, 2, 3]) {
+    push([nd(s,1,1),nd(s,1,2),nd(s,1,3),nd(s,1,4),nd(s,1,5)]);
+    push([nd(s,5,1),nd(s,5,2),nd(s,5,3),nd(s,5,4),nd(s,5,5)]);
+    push([nd(s,1,1),nd(s,2,1),nd(s,3,1),nd(s,4,1),nd(s,5,1)]);
+    push([nd(s,1,5),nd(s,2,5),nd(s,3,5),nd(s,4,5),nd(s,5,5)]);
+  }
+  // 角弧并线（side: 0南 1东 2北 3西）：四圈各一条 15 子长线
+  push([nd(1,5,1),nd(1,4,1),nd(1,3,1),nd(1,2,1),nd(1,1,1), nd(0,1,5),nd(0,1,4),nd(0,1,3),nd(0,1,2),nd(0,1,1), nd(3,1,5),nd(3,2,5),nd(3,3,5),nd(3,4,5),nd(3,5,5)]); // 南横r1圈
+  push([nd(3,5,1),nd(3,4,1),nd(3,3,1),nd(3,2,1),nd(3,1,1), nd(2,1,5),nd(2,1,4),nd(2,1,3),nd(2,1,2),nd(2,1,1), nd(1,1,5),nd(1,2,5),nd(1,3,5),nd(1,4,5),nd(1,5,5)]); // 北横r1圈
+  push([nd(2,5,5),nd(2,4,5),nd(2,3,5),nd(2,2,5),nd(2,1,5), nd(3,1,1),nd(3,1,2),nd(3,1,3),nd(3,1,4),nd(3,1,5), nd(0,1,1),nd(0,2,1),nd(0,3,1),nd(0,4,1),nd(0,5,1)]); // 西纵c1圈
+  push([nd(2,5,1),nd(2,4,1),nd(2,3,1),nd(2,2,1),nd(2,1,1), nd(1,1,5),nd(1,1,4),nd(1,1,3),nd(1,1,2),nd(1,1,1), nd(0,1,5),nd(0,2,5),nd(0,3,5),nd(0,4,5),nd(0,5,5)]); // 东纵c1圈
+}
+// 校验：节点与边数必须符合权威拓扑（129 / 288）
+
+// ---------- 布阵槽位（每方）----------
+const LAYOUT_SLOTS = [];
+for (let s = 0; s < 4; s++) {
+  const all = [], back2 = [], noBomb = [], hq = [];
+  for (let r = 1; r <= 6; r++) for (let c = 1; c <= 5; c++) {
+    const n = nd(s, r, c);
+    if (NODES[n].kind === 1) continue;               // 行营留空
+    all.push(n);
+    if (r >= 5) back2.push(n);                       // 地雷限最后两排
+    if (r !== 1) noBomb.push(n);                     // 炸弹不限前线
+    if (NODES[n].kind === 2) hq.push(n);
+  }
+  LAYOUT_SLOTS.push({ all, back2, noBomb, hq });
+}
+
+// ---------- 快速布局（合法随机摆法）----------
+function randomLayout(side) {
+  const slots = LAYOUT_SLOTS[side];
+  const place = new Map();
+  const freeIn = arr => arr.filter(n => !place.has(n));
+  const putMany = (cand, type, count) => {
+    const arr = freeIn(cand);
+    for (let i = 0; i < count; i++) {
+      const j = (Math.random() * (arr.length - i)) | 0;
+      const v = arr[j]; arr[j] = arr[arr.length - 1 - i]; arr[arr.length - 1 - i] = v;
+      place.set(v, type);
+    }
+  };
+  place.set(slots.hq[(Math.random() * 2) | 0], JUNQI);   // 军旗进大本营
+  putMany(slots.back2, DILEI, 3);
+  putMany(slots.noBomb, ZHADAN, 2);
+  const rem = [];
+  for (const [t, n] of PIECE_COUNTS) {
+    let used = 0; for (const v of place.values()) if (v === t) used++;
+    for (let i = 0; i < n - used; i++) rem.push(t);
+  }
+  const empt = slots.all.filter(n => !place.has(n));
+  for (let i = empt.length - 1; i > 0; i--) { const j = (Math.random() * (i + 1)) | 0; [empt[i], empt[j]] = [empt[j], empt[i]]; }
+  rem.forEach((t, i) => place.set(empt[i], t));
+  return place;
+}
+
+// ---------- 对局状态 ----------
+let DRAW_LIMIT = 200;          // 连续无战损步数判和（全局量，测试可压低）
+const G = {
+  screen: 'menu',              // menu | play
+  modeName: '',
+  seats: ['human','ai','ai','ai'],        // side 下标 → 'human' | 'ai'
+  board: null,                 // Array(129)，0 空 / side*16+type
+  alive: [true, true, true, true],
+  reveal: [false, false, false, false],   // 司令阵亡亮旗
+  turn: 0, sel: -1, legal: [],
+  ply: 0, noCap: 0,
+  over: null,                  // {kind:'win'|'draw', team?}
+  log: [],                     // 战报 {txt, side}
+  snaps: [],                   // 悔棋快照
+  lastMove: null, anim: null,
+  pendingAi: 0,                // AI 出手时间戳（0 = 无）
+  sound: true,
+  diff: 1,
+  menuSel: { mode: 0 },
+};
+const DIFFS = [
+  { name: '简单', noise: 60,  tol: 999, think: 420 },
+  { name: '普通', noise: 22,  tol: 28,  think: 460 },
+  { name: '困难', noise: 6,   tol: 3,   think: 520 },
+];
+function applyDiff(i) {
+  G.diff = i;
+  try { localStorage.setItem('junqi-diff', String(i)); } catch (e) {}
+}
+(function loadDiff() {
+  let i = 1;
+  try { const v = localStorage.getItem('junqi-diff'); if (v !== null && DIFFS[+v]) i = +v; } catch (e) {}
+  applyDiff(i);
+})();
+let hits = [], mouse = { x: -1, y: -1 };
+
+function newGame() {
+  G.board = new Array(NODES.length).fill(0);
+  for (let s = 0; s < 4; s++) {
+    const layout = randomLayout(s);
+    for (const [n, t] of layout) G.board[n] = mkPiece(s, t);
+  }
+  G.alive = [true, true, true, true];
+  G.reveal = [false, false, false, false];
+  G.turn = 0; G.sel = -1; G.legal = [];
+  G.ply = 0; G.noCap = 0; G.over = null; G.log = []; G.snaps = [];
+  G.lastMove = null; G.anim = null; G.pendingAi = 0;
+}
+
+const MODES = [
+  { id: 'solo',  label: '单人挑战', desc: '你坐蓝 · 三 AI 作伴' },
+  { id: 'duo',   label: '双人同盟', desc: '蓝黄两席真人 · 同队抗绿红' },
+  { id: 'rival', label: '双人对练', desc: '蓝绿两席真人 · 各带 AI 队友' },
+  { id: 'demo',  label: '电脑演示', desc: '四席全 AI · 自战观战' },
+];
+function startMatch(modeId) {
+  const m = MODES.find(x => x.id === modeId) || MODES[0];
+  G.seats = ['ai','ai','ai','ai'];
+  if (m.id === 'solo')  G.seats[0] = 'human';
+  if (m.id === 'duo')  { G.seats[0] = 'human'; G.seats[2] = 'human'; }
+  if (m.id === 'rival'){ G.seats[0] = 'human'; G.seats[1] = 'human'; }
+  G.modeName = m.label;
+  newGame();
+  G.screen = 'play';
+  pushLog('对局开始 · ' + m.label + ' · ' + DIFFS[G.diff].name, -1);
+  scheduleAi();
+}
+function currentKind() {
+  const h = G.seats.filter(x => x === 'human').length;
+  if (!h) return 'demo';
+  if (h === 1) return 'solo';
+  return G.seats[0] === 'human' && G.seats[2] === 'human' ? 'duo' : 'rival';
+}
+const seatIsHuman = s => G.seats[s] === 'human';
+
+// ---------- 走法生成 ----------
+// 公路一步 + 铁路直线滑行 + 工兵铁路 BFS
+function legalMoves(b, side) {
+  const out = [];
+  const seen = new Set();
+  const push = (from, to) => { const k = from * 1024 + to; if (!seen.has(k)) { seen.add(k); out.push({ from, to }); } };
+  for (let n = 0; n < b.length; n++) {
+    const p = b[n];
+    if (!p || pSide(p) !== side) continue;
+    const t = pType(p);
+    if (t === DILEI || t === JUNQI) continue;        // 地雷、军旗永不移动
+    if (NODES[n].kind === 2) continue;               // 大本营之子锁定
+    // 公路一步（含行营斜线）
+    for (const e of NEIGH[n]) {
+      if (e.rail) continue;
+      roadStep(push, b, side, n, e.to);
+    }
+    // 铁路
+    if (t === GONGBING) railBfs(push, b, side, n, out);
+    else railSlide(push, b, side, n);
+  }
+  return out;
+}
+function roadStep(push, b, side, from, to) {
+  const q = b[to];
+  if (!q) { push(from, to); return; }
+  if (teamOf(pSide(q)) === teamOf(side)) return;    // 队友不可攻
+  if (NODES[to].kind === 1) return;                 // 行营内不可被攻击
+  push(from, to);
+}
+function railSlide(push, b, side, from) {
+  for (const line of RAIL_LINES) {
+    const i = line.indexOf(from);
+    if (i < 0) continue;
+    for (let k = i + 1; k < line.length; k++) { roadStep(push, b, side, from, line[k]); if (b[line[k]]) break; }
+    for (let k = i - 1; k >= 0; k--)               { roadStep(push, b, side, from, line[k]); if (b[line[k]]) break; }
+  }
+}
+function railBfs(push, b, side, from) {
+  const seen = new Uint8Array(b.length);
+  const queue = [from];
+  seen[from] = 1;
+  while (queue.length) {
+    const n = queue.shift();
+    for (const e of NEIGH[n]) {
+      if (!e.rail || seen[e.to]) continue;
+      seen[e.to] = 1;
+      const q = b[e.to];
+      if (!q) push(from, e.to), queue.push(e.to);
+      else if (teamOf(pSide(q)) !== teamOf(side) && NODES[e.to].kind !== 1) push(from, e.to);
+    }
+  }
+}
+
+// ---------- 走子流程 ----------
+function snapshot() {
+  return {
+    board: G.board.slice(), alive: G.alive.slice(), reveal: G.reveal.slice(),
+    turn: G.turn, ply: G.ply, noCap: G.noCap, logLen: G.log.length,
+  };
+}
+function pushLog(txt, side) { G.log.push({ txt, side }); if (G.log.length > 60) G.log.shift(); }
+
+function applyMove(m) {
+  if (G.snaps.length > 400) G.snaps.shift();
+  G.snaps.push(snapshot());
+  const b = G.board;
+  const att = b[m.from], def = b[m.to];
+  const aS = pSide(att), aT = pType(att);
+  const sn = SIDE_COLOR[aS].name;
+  G.sel = -1; G.legal = [];
+  G.anim = { from: m.from, to: m.to, piece: att, t0: performance.now() };
+  G.lastMove = m;
+  if (!def) {
+    b[m.to] = att; b[m.from] = 0;
+    G.noCap++; sfx.move();
+  } else {
+    const dS = pSide(def), dT = pType(def);
+    G.noCap = 0;
+    if (dT === JUNQI) {
+      // 扛旗：旗方全军覆没出局
+      b[m.from] = 0;
+      pushLog(sn + '方' + PIECE_NAME[aT] + '扛起' + SIDE_COLOR[dS].name + '方军旗！', aS);
+      if (aT === ZHADAN) { /* 炸弹攻旗同毁 */ }
+      else b[m.to] = att;
+      sfx.capture(); sfx.flag();
+      eliminate(dS, '军旗被扛');
+    } else {
+      const [aOk, dOk] = combat(att, def);
+      const txt = sn + PIECE_NAME[aT] + ' 攻 ' + SIDE_COLOR[dS].name + PIECE_NAME[dT] +
+                  (aOk && !dOk ? ' · 吃子' : !aOk && dOk ? ' · 战死' : ' · 同归于尽');
+      pushLog(txt, aS);
+      b[m.from] = aOk ? att : 0;
+      b[m.to]   = aOk && !dOk ? att : (dOk ? def : 0);
+      if (aT === SIMING && !aOk) { G.reveal[aS] = true; pushLog(SIDE_COLOR[aS].name + '方司令阵亡，亮旗！', aS); }
+      if (dT === SIMING && !dOk) { G.reveal[dS] = true; pushLog(SIDE_COLOR[dS].name + '方司令阵亡，亮旗！', dS); }
+      sfx.capture();
+    }
+  }
+  G.ply++;
+  // 出局判定：无子可动
+  for (let s = 0; s < 4; s++)
+    if (G.alive[s] && !legalMoves(G.board, s).length) eliminate(s, '无子可动');
+  // 胜负与和棋
+  const teamAlive = [G.alive[0] || G.alive[2], G.alive[1] || G.alive[3]];
+  if (!teamAlive[0] && !teamAlive[1]) { setOver({ kind: 'draw' }); return; }
+  if (!teamAlive[0]) { setOver({ kind: 'win', team: 1 }); return; }
+  if (!teamAlive[1]) { setOver({ kind: 'win', team: 0 }); return; }
+  if (G.noCap >= DRAW_LIMIT || G.ply >= 1600) { setOver({ kind: 'draw' }); return; }
+  advanceTurn();
+  scheduleAi();
+}
+function eliminate(side, reason) {
+  if (!G.alive[side]) return;
+  G.alive[side] = false;
+  for (let n = 0; n < G.board.length; n++) if (G.board[n] && pSide(G.board[n]) === side) G.board[n] = 0;
+  pushLog(SIDE_COLOR[side].name + '方' + reason + '，全军覆没出局', side);
+}
+function advanceTurn() {
+  let guard = 0;
+  do { G.turn = (G.turn + 1) % 4; } while (!G.alive[G.turn] && ++guard < 8);
+}
+function setOver(o) {
+  G.over = o;
+  G.pendingAi = 0;
+  if (o.kind === 'win') {
+    const human = G.seats.some(x => x === 'human');
+    const humanTeam = human && seatIsHuman(0) ? 0 : (human && seatIsHuman(1) ? 1 : -1);
+    if (human && humanTeam >= 0) { if (humanTeam === o.team) sfx.win(); else sfx.lose(); bumpStat(o.team === humanTeam ? 'win' : 'loss'); }
+    else sfx.win();
+    pushLog((o.team === 0 ? '蓝黄队' : '绿红队') + '胜利！', o.team === 0 ? 0 : 1);
+  } else { sfx.deny(); bumpStat('draw'); pushLog('连续无战损，判和。', -1); }
+}
+
+// ---------- 悔棋（快照制，一直退到轮到真人）----------
+function doUndo() {
+  if (!G.snaps.length || G.screen !== 'play') return;
+  if (!G.seats.some(x => x === 'human')) return;
+  G.pendingAi = 0; G.anim = null; G.over = null;
+  let guard = 0;
+  do {
+    const s = G.snaps.pop();
+    if (!s) break;
+    G.board = s.board; G.alive = s.alive; G.reveal = s.reveal;
+    G.turn = s.turn; G.ply = s.ply; G.noCap = s.noCap;
+    G.log.length = s.logLen;
+    guard++;
+  } while (!seatIsHuman(G.turn) && G.snaps.length && guard < 12);
+  G.sel = -1; G.legal = [];
+  G.lastMove = null;
+  scheduleAi();
+  sfx.click();
+}
+
+// ---------- AI ----------
+function scheduleAi() {
+  if (G.over || G.screen !== 'play') { G.pendingAi = 0; return; }
+  G.pendingAi = seatIsHuman(G.turn) ? 0 : performance.now() + DIFFS[G.diff].think;
+}
+function enemyThreatMap(b, side) {
+  // 返回 Map<node, 最大威胁子 type>：所有非同盟方可一步/滑行打到该格的子中最大者
+  const th = new Map();
+  for (const es of [0, 1, 2, 3]) {
+    if (!G.alive[es] || teamOf(es) === teamOf(side)) continue;
+    for (const m of legalMoves(b, es)) {
+      const p = b[m.from], cur = th.get(m.to);
+      if (!cur || pType(p) > cur) th.set(m.to, pType(p));
+    }
+  }
+  return th;
+}
+function forwardGain(side, from, to) {
+  const a = NODES[from], c = NODES[to];
+  if (side === 0) return a.gy - c.gy;      // 南向北推进
+  if (side === 2) return c.gy - a.gy;
+  if (side === 3) return c.gx - a.gx;      // 西向东
+  return a.gx - c.gx;                      // 东向西
+}
+function aiScoreMove(b, side, m, threat) {
+  const d = DIFFS[G.diff];
+  const att = b[m.from], def = b[m.to];
+  const aT = pType(att);
+  let score = Math.random() * d.noise;
+  const toKind = NODES[m.to].kind;
+  if (toKind === 2 && teamOf(NODES[m.to].s) === teamOf(side)) score -= 60;   // 别把自己焊进本方大本营
+  if (def) {
+    const dT = pType(def);
+    if (dT === JUNQI) return 1e6 + score;                                     // 扛旗优先
+    const [aOk, dOk] = combat(att, def);
+    let gain = dOk ? 0 : VAL[dT];
+    let loss = aOk ? 0 : VAL[aT];
+    if (dT === DILEI && aT === GONGBING) gain += 20;                          // 挖雷奖励
+    if (aT === dT) score -= 10 + (aT >= SHIZHANG ? 30 : 0);                   // 同归：大子换小亏
+    else score += gain - loss;
+    if (!dOk && aOk) {
+      const t = threat.get(m.to);                                             // 吃子后反被更大子报复
+      if (t !== undefined && t > aT) score -= VAL[aT] * 0.9;
+    }
+    if (aT === ZHADAN && dOk && dT < LVZHANG) score -= 40;                    // 炸弹换小子不值
+  } else {
+    if (G.diff === 2) {
+      const t = threat.get(m.to);
+      if (t !== undefined && t > aT) score -= VAL[aT] * 0.7;                  // 困难档躲吃
+    }
+    score += forwardGain(side, m.from, m.to) * 2;
+    if (toKind === 1) score += 3;                                             // 行营歇脚
+  }
+  return score;
+}
+function aiChoose(side) {
+  const ms = legalMoves(G.board, side);
+  if (!ms.length) return null;
+  const d = DIFFS[G.diff];
+  if (d.noise > 50) {                                   // 简单档：半随机
+    const caps = ms.filter(m => G.board[m.to]);
+    if (caps.length && Math.random() < 0.5) return caps[(Math.random() * caps.length) | 0];
+    return ms[(Math.random() * ms.length) | 0];
+  }
+  const threat = enemyThreatMap(G.board, side);
+  const scored = ms.map(m => ({ m, s: aiScoreMove(G.board, side, m, threat) }));
+  scored.sort((a, b) => b.s - a.s);
+  const top = scored[0].s;
+  const pool = scored.filter(x => x.s >= top - d.tol);
+  return pool[(Math.random() * pool.length) | 0].m;
+}
+function stepAiTurn() {
+  if (G.over || G.screen !== 'play') return;
+  const side = G.turn;
+  if (seatIsHuman(side)) { G.pendingAi = 0; return; }
+  G.pendingAi = 0;
+  const m = aiChoose(side);
+  if (m) applyMove(m);
+  else { eliminate(side, '无子可动'); advanceTurn(); scheduleAi(); }
+}
+
+// ---------- 战绩 ----------
+function loadStats() { try { return JSON.parse(localStorage.getItem('junqi-stats-v1')) || { win: 0, loss: 0, draw: 0 }; } catch (e) { return { win: 0, loss: 0, draw: 0 }; } }
+function bumpStat(k) {
+  if (!G.seats.some(x => x === 'human')) return;
+  const s = loadStats(); s[k] = (s[k] || 0) + 1;
+  try { localStorage.setItem('junqi-stats-v1', JSON.stringify(s)); } catch (e) {}
+}
+
+// =====================================================================
+// 以下为界面层
+// =====================================================================
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const dpr = typeof devicePixelRatio !== 'undefined' ? Math.min(devicePixelRatio, 2) : 1;
+let W = 1180, H = 800;                              // 设计坐标（随横/竖屏切换）
+let CELL = 43, BX = 52, BY = 72;                    // 网格原点与间距（gx/gy 0..16）
+let PORTRAIT = false;                               // 竖屏：棋盘在上、面板在下
+const PX = g => BX + g * CELL, PY = g => BY + g * CELL;
+
+function applyLayout() {
+  const iw = window.innerWidth || 1180, ih = window.innerHeight || 800;
+  PORTRAIT = iw <= 900 && ih > iw * 1.08;
+  if (PORTRAIT) { W = 660; H = 1214; CELL = 36; BX = (W - CELL * 16) / 2; BY = 52; }
+  else { W = 1180; H = 800; CELL = 43; BX = 52; BY = 72; }
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cv.style.aspectRatio = W + ' / ' + H;
+}
+applyLayout();
+if (window.addEventListener) {
+  const relayout = () => { applyLayout(); draw(); };
+  window.addEventListener('resize', relayout);
+  window.addEventListener('orientationchange', relayout);
+}
+
+// ---------- 音效（Web Audio 合成）----------
+let AC = null;
+function ac() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(freq, dur, type, gain, when = 0) {
+  const a = ac(); if (!a || !G.sound) return;
+  const t = a.currentTime + when;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(freq * 0.6, 40), t + dur);
+  g.gain.setValueAtTime(gain, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const sfx = {
+  move()   { tone(300, 0.06, 'square', 0.05); tone(170, 0.08, 'sine', 0.08); },
+  capture(){ tone(220, 0.07, 'square', 0.08); tone(110, 0.18, 'sawtooth', 0.09); tone(65, 0.22, 'sine', 0.10, 0.03); },
+  flag()   { [392, 330, 262, 175].forEach((f, i) => tone(f, 0.24, 'triangle', 0.09, i * 0.10)); },
+  win()    { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'triangle', 0.08, i * 0.12)); },
+  lose()   { [392, 330, 262, 196].forEach((f, i) => tone(f, 0.2, 'triangle', 0.07, i * 0.14)); },
+  click()  { tone(520, 0.04, 'square', 0.04); },
+  deny()   { tone(140, 0.12, 'sawtooth', 0.06); },
+};
+
+// ---------- 渲染 ----------
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function button(id, x, y, w, h, label, opts = {}) {
+  const hov = !opts.disabled && mouse.x >= x && mouse.x <= x + w && mouse.y >= y && mouse.y <= y + h;
+  hits.push({ x, y, w, h, id, disabled: !!opts.disabled });
+  ctx.save();
+  roundRect(x, y, w, h, 10);
+  const grad = ctx.createLinearGradient(x, y, x, y + h);
+  if (opts.disabled)    { grad.addColorStop(0, '#4a5148'); grad.addColorStop(1, '#393f38'); }
+  else if (opts.active) { grad.addColorStop(0, '#e9d9a8'); grad.addColorStop(1, '#c9ab55'); }
+  else if (opts.dim)    { grad.addColorStop(0, hov ? '#5a6450' : '#47503f'); grad.addColorStop(1, hov ? '#4c5544' : '#3a4235'); }
+  else if (hov)         { grad.addColorStop(0, '#8fae6d'); grad.addColorStop(1, '#6f8f50'); }
+  else                  { grad.addColorStop(0, '#6f8f50'); grad.addColorStop(1, '#53693b'); }
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.lineWidth = opts.active ? 3 : 1.6;
+  ctx.strokeStyle = opts.disabled ? '#5a615a' : (opts.active ? '#fff3d6' : '#31401f');
+  ctx.stroke();
+  ctx.fillStyle = opts.disabled ? '#8b918a' : (opts.active ? '#3a2f10' : '#eef4e4');
+  ctx.font = `700 ${opts.font || 16}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w / 2, y + h / 2 + 1);
+  ctx.restore();
+}
+function star(x, y, r, fill) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * 0.45 : r;
+    ctx[i ? 'lineTo' : 'moveTo'](x + rr * Math.cos(a), y + rr * Math.sin(a));
+  }
+  ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+}
+const TEAM_NAME = ['蓝黄队', '绿红队'];
+// 各阵营阵地中心（呼吸描边用）
+const SIDE_CTR = [{ gx: 8, gy: 13.5 }, { gx: 13.5, gy: 8 }, { gx: 8, gy: 2.5 }, { gx: 2.5, gy: 8 }];
+
+function drawEdges() {
+  ctx.lineCap = 'round';
+  // 公路（细）
+  ctx.strokeStyle = '#48543f'; ctx.lineWidth = Math.max(1.4, CELL * 0.05);
+  ctx.beginPath();
+  for (const e of EDGES) {
+    if (e.rail) continue;
+    const a = NODES[e.a], b = NODES[e.b];
+    ctx.moveTo(PX(a.gx), PY(a.gy)); ctx.lineTo(PX(b.gx), PY(b.gy));
+  }
+  ctx.stroke();
+  // 铁路（枕木描边 + 亮芯，弧线走贝塞尔）
+  for (const pass of [[CELL * 0.20, '#10140f'], [CELL * 0.10, '#8b9783']]) {
+    ctx.strokeStyle = pass[1]; ctx.lineWidth = pass[0];
+    ctx.beginPath();
+    for (const e of EDGES) {
+      if (!e.rail) continue;
+      const a = NODES[e.a], b = NODES[e.b];
+      ctx.moveTo(PX(a.gx), PY(a.gy));
+      if (e.ctrl) ctx.quadraticCurveTo(PX(e.ctrl[0]), PY(e.ctrl[1]), PX(b.gx), PY(b.gy));
+      else ctx.lineTo(PX(b.gx), PY(b.gy));
+    }
+    ctx.stroke();
+  }
+}
+function drawNodes() {
+  for (let n = 0; n < NODES.length; n++) {
+    const d = NODES[n], x = PX(d.gx), y = PY(d.gy);
+    ctx.beginPath();
+    if (d.kind === 1) {                       // 行营（安全岛）
+      ctx.arc(x, y, CELL * 0.36, 0, 7);
+      ctx.fillStyle = '#2e5a44'; ctx.fill();
+      ctx.lineWidth = 1.6; ctx.strokeStyle = '#6f9d84'; ctx.stroke();
+    } else if (d.kind === 2) {                // 大本营
+      ctx.arc(x, y, CELL * 0.40, 0, 7);
+      ctx.fillStyle = '#3b3324'; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = '#c8a852'; ctx.stroke();
+      star(x, y, CELL * 0.16, 'rgba(230,200,120,0.55)');
+    } else {                                  // 兵站
+      ctx.arc(x, y, CELL * 0.24, 0, 7);
+      ctx.fillStyle = '#333c31'; ctx.fill();
+      ctx.lineWidth = 1.2; ctx.strokeStyle = '#59664f'; ctx.stroke();
+    }
+  }
+}
+function drawPieceAt(node, p, dx = 0, dy = 0, scale = 1) {
+  const d = NODES[node], side = pSide(p), t = pType(p);
+  const x = PX(d.gx) + dx, y = PY(d.gy) + dy;
+  const w = CELL * 0.86 * scale, h = CELL * 0.62 * scale;
+  ctx.save();
+  roundRect(x - w / 2, y - h / 2, w, h, 5);
+  const g = ctx.createLinearGradient(x, y - h / 2, x, y + h / 2);
+  g.addColorStop(0, SIDE_COLOR[side].base); g.addColorStop(1, SIDE_COLOR[side].dark);
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 1.6; ctx.strokeStyle = SIDE_COLOR[side].light; ctx.stroke();
+  ctx.fillStyle = '#fdf6e3';
+  ctx.font = `700 ${Math.round(CELL * 0.27)}px "PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(PIECE_NAME[t], x, y + 1);
+  ctx.restore();
+}
+function drawMarkers(now) {
+  // 回合呼吸环（当前阵营阵地中心）
+  if (G.alive[G.turn]) {
+    const c = SIDE_CTR[G.turn];
+    ctx.beginPath();
+    ctx.arc(PX(c.gx), PY(c.gy), CELL * (1.7 + 0.22 * Math.sin(now / 240)), 0, 7);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = SIDE_COLOR[G.turn].light;
+    ctx.globalAlpha = 0.35 + 0.2 * Math.sin(now / 240);
+    ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  // 上一手标记
+  if (G.lastMove) {
+    const a = NODES[G.lastMove.from], b = NODES[G.lastMove.to];
+    ctx.beginPath();
+    ctx.moveTo(PX(a.gx), PY(a.gy)); ctx.lineTo(PX(b.gx), PY(b.gy));
+    ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(240,220,150,0.5)'; ctx.stroke();
+  }
+  // 亮旗提示
+  for (let s = 0; s < 4; s++) {
+    if (!G.reveal[s] || !G.alive[s]) continue;
+    for (const n of LAYOUT_SLOTS[s].hq) {
+      if (G.board[n] && pType(G.board[n]) === JUNQI) {
+        const d = NODES[n];
+        ctx.beginPath(); ctx.arc(PX(d.gx), PY(d.gy), CELL * (0.52 + 0.08 * Math.sin(now / 200)), 0, 7);
+        ctx.lineWidth = 2.4; ctx.strokeStyle = '#ff7a5e'; ctx.stroke();
+      }
+    }
+  }
+  // 选中与可行点
+  if (G.sel >= 0) {
+    const d = NODES[G.sel];
+    ctx.beginPath(); ctx.arc(PX(d.gx), PY(d.gy), CELL * 0.52, 0, 7);
+    ctx.lineWidth = 3; ctx.strokeStyle = '#ffd873'; ctx.stroke();
+    for (const m of G.legal) {
+      const t = NODES[m.to];
+      if (G.board[m.to]) {
+        ctx.beginPath(); ctx.arc(PX(t.gx), PY(t.gy), CELL * 0.55, 0, 7);
+        ctx.lineWidth = 2.6; ctx.strokeStyle = 'rgba(255,90,70,0.9)'; ctx.stroke();
+      } else {
+        ctx.beginPath(); ctx.arc(PX(t.gx), PY(t.gy), CELL * 0.16, 0, 7);
+        ctx.fillStyle = 'rgba(150,230,150,0.85)'; ctx.fill();
+      }
+    }
+  }
+}
+function drawPieces(now) {
+  const animTo = G.anim ? G.anim.to : -1;
+  for (let n = 0; n < G.board.length; n++) {
+    const p = G.board[n];
+    if (!p || n === animTo) continue;
+    // 大本营锁定子加挂小锁点
+    drawPieceAt(n, p);
+    if (NODES[n].kind === 2 && pType(p) !== JUNQI) {
+      ctx.beginPath(); ctx.arc(PX(NODES[n].gx) + CELL * 0.32, PY(NODES[n].gy) - CELL * 0.22, 2.6, 0, 7);
+      ctx.fillStyle = '#ffd873'; ctx.fill();
+    }
+  }
+  if (G.anim) {
+    const k = Math.min(1, (now - G.anim.t0) / 190);
+    const a = NODES[G.anim.from], b = NODES[G.anim.to];
+    drawPieceAt(G.anim.from, G.anim.piece, (b.gx - a.gx) * CELL * k, (b.gy - a.gy) * CELL * k);
+  }
+}
+
+// ---------- 侧栏 / 面板 ----------
+function aliveCount(s) { let n = 0; for (const p of G.board) if (p && pSide(p) === s) n++; return n; }
+function drawPanel(now) {
+  const P = PORTRAIT
+    ? { x: 26, y: BY + CELL * 16 + 18, w: W - 52, chipH: 34, gap: 6, logN: 6 }
+    : { x: BX + CELL * 16 + 26, y: 14, w: W - (BX + CELL * 16) - 40, chipH: 46, gap: 8, logN: 8 };
+  ctx.save();
+  ctx.textBaseline = 'middle';
+  // 标题（横屏在棋盘上方，竖屏在顶栏）
+  ctx.fillStyle = '#d8e2cc';
+  ctx.font = '800 20px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = 'left';
+  const titleY = PORTRAIT ? 30 : P.y + 12;
+  ctx.fillText('四国军棋', PORTRAIT ? 26 : P.x, titleY);
+  ctx.font = '600 12px "PingFang SC",sans-serif'; ctx.fillStyle = '#8b9684';
+  const turnName = SIDE_COLOR[G.turn].name + '方';
+  const hint = G.over ? '对局结束' : seatIsHuman(G.turn) ? `轮到${turnName}（真人）` : `${turnName}思考中…`;
+  ctx.textAlign = 'right';
+  ctx.fillText(`${G.modeName} · ${DIFFS[G.diff].name} · 第${G.ply}手 · ${hint}`, PORTRAIT ? W - 26 : W - 20, titleY);
+  let y = P.y + (PORTRAIT ? 46 : 34);
+  // 四席位卡
+  for (let s = 0; s < 4; s++) {
+    const rowY = y + s * (P.chipH + P.gap);
+    ctx.save();
+    roundRect(P.x, rowY, P.w, P.chipH, 9);
+    ctx.fillStyle = G.alive[s] ? '#242b22' : '#1d201c'; ctx.fill();
+    const act = s === G.turn && !G.over && G.alive[s];
+    ctx.lineWidth = act ? 2.6 : 1.2;
+    ctx.strokeStyle = act ? SIDE_COLOR[s].light : '#39413a';
+    if (act) { ctx.globalAlpha = 0.7 + 0.3 * Math.sin(now / 240); }
+    ctx.stroke(); ctx.globalAlpha = 1;
+    const cx = P.x + 16;
+    ctx.beginPath(); ctx.arc(cx, rowY + P.chipH / 2, 8, 0, 7);
+    ctx.fillStyle = G.alive[s] ? SIDE_COLOR[s].base : '#4a4f4a'; ctx.fill();
+    ctx.strokeStyle = SIDE_COLOR[s].light; ctx.lineWidth = 1.4; ctx.stroke();
+    ctx.textAlign = 'left'; ctx.font = '700 14px "PingFang SC",sans-serif';
+    ctx.fillStyle = G.alive[s] ? '#e8eee0' : '#6d746b';
+    ctx.fillText(SIDE_COLOR[s].name + '方', cx + 16, rowY + P.chipH / 2);
+    ctx.font = '600 12px "PingFang SC",sans-serif'; ctx.fillStyle = '#9aa492';
+    const who = !G.alive[s] ? '出局' : (seatIsHuman(s) ? (s === 0 ? '你' : seatIsHuman(0) ? '真人' + (s + 1) : '真人') : '电脑');
+    ctx.textAlign = 'center';
+    ctx.fillText(who + (G.alive[s] ? ` · ${['南','东','北','西'][s]}` : ''), cx + 92, rowY + P.chipH / 2);
+    if (G.alive[s]) {
+      ctx.textAlign = 'right'; ctx.fillStyle = '#77cf8a';
+      ctx.fillText(`在场 ${aliveCount(s)}/25`, P.x + P.w - 12, rowY + P.chipH / 2);
+    }
+    ctx.restore();
+  }
+  y += 4 * (P.chipH + P.gap) + 8;
+  // 按钮区
+  const bw = (P.w - 3 * 8) / 4;
+  const canUndo = G.snaps.length > 0 && G.seats.some(x => x === 'human') && !G.pendingAi && !G.over;
+  button('undo', P.x, y, bw, 34, '悔棋', { disabled: !canUndo, font: 14 });
+  button('restart', P.x + (bw + 8), y, bw, 34, '重开', { font: 14 });
+  button('menu', P.x + 2 * (bw + 8), y, bw, 34, '换模式', { font: 14 });
+  button('sound', P.x + 3 * (bw + 8), y, bw, 34, G.sound ? '音效·开' : '音效·关', { dim: true, font: 14 });
+  y += 42;
+  const dw = (P.w - 2 * 8) / 3;
+  for (let i = 0; i < 3; i++)
+    button('diff' + i, P.x + i * (dw + 8), y, dw, 28, DIFFS[i].name + 'AI', { active: G.diff === i, font: 13 });
+  y += 36;
+  // 战绩
+  const st = loadStats();
+  ctx.textAlign = 'left'; ctx.font = '600 12px "PingFang SC",sans-serif'; ctx.fillStyle = '#8b9684';
+  ctx.fillText(`战绩（你所在队） 胜 ${st.win || 0} · 负 ${st.loss || 0} · 和 ${st.draw || 0}`, P.x, y + 6);
+  y += 22;
+  // 战报
+  ctx.fillStyle = '#1d221c'; roundRect(P.x, y, P.w, P.logN * 20 + 10, 8); ctx.fill();
+  ctx.strokeStyle = '#333b32'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.font = '600 12px "PingFang SC",sans-serif';
+  const logs = G.log.slice(-P.logN);
+  logs.forEach((L, i) => {
+    const ly = y + 15 + i * 20;
+    if (L.side >= 0) { ctx.fillStyle = SIDE_COLOR[L.side].base; ctx.fillRect(P.x + 8, ly - 4, 8, 8); }
+    ctx.fillStyle = i === logs.length - 1 ? '#d8e2cc' : '#8b9684';
+    let t = L.txt;
+    while (ctx.measureText(t).width > P.w - 34 && t.length > 4) t = t.slice(0, -2);
+    if (t !== L.txt) t = t.slice(0, -1) + '…';
+    ctx.fillText(t, P.x + 22, ly, P.w - 30);
+  });
+  ctx.restore();
+}
+
+// ---------- 菜单 / 结算 ----------
+function overlayScrim(alpha) {
+  ctx.fillStyle = `rgba(10,12,10,${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+function drawMenu() {
+  const mw = PORTRAIT ? W - 52 : 640;
+  // 卡片高度按内容自适应，避免“开始游戏”按钮贴出下缘
+  const mh = PORTRAIT ? 640 : Math.min(H - 40, 334 + 32 + 26 + 46 + 26 + 16);
+  const mx = (W - mw) / 2, my = (H - mh) / 2;
+  ctx.save();
+  roundRect(mx, my, mw, mh, 22);
+  const g = ctx.createLinearGradient(mx, my, mx, my + mh);
+  g.addColorStop(0, '#2b332a'); g.addColorStop(1, '#20261f');
+  ctx.fillStyle = g; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#4d5a48'; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#eef4e4';
+  ctx.font = '800 40px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText('四 国 军 棋', W / 2, my + 62);
+  ctx.font = '600 14px "PingFang SC",sans-serif'; ctx.fillStyle = '#9aa492';
+  ctx.fillText('四席逆时针轮转 · 南蓝北黄一队 vs 东绿西红一队 · 明棋', W / 2, my + 98);
+  const cw = (mw - 60) / 2, ch = 88;
+  MODES.forEach((m, i) => {
+    const cx = mx + 24 + (i % 2) * (cw + 12), cy = my + 128 + ((i / 2) | 0) * (ch + 12);
+    button('mode' + i, cx, cy, cw, ch, '', { active: G.menuSel.mode === i });
+    ctx.fillStyle = G.menuSel.mode === i ? '#3a2f10' : '#eef4e4';
+    ctx.font = '800 19px "PingFang SC",sans-serif';
+    ctx.fillText(m.label, cx + cw / 2, cy + 32);
+    ctx.font = '600 12px "PingFang SC",sans-serif';
+    ctx.fillStyle = G.menuSel.mode === i ? '#5d4c1d' : '#9aa492';
+    ctx.fillText(m.desc, cx + cw / 2, cy + 60);
+  });
+  ctx.textAlign = 'left'; ctx.fillStyle = '#9aa492'; ctx.font = '600 13px "PingFang SC",sans-serif';
+  ctx.fillText('电脑棋艺', mx + 26, my + 350);
+  const dw = (mw - 26 * 2 - 16 * 2) / 3;
+  for (let i = 0; i < 3; i++)
+    button('diff' + i, mx + 26 + i * (dw + 16), my + 334, dw, 32, DIFFS[i].name, { active: G.diff === i, font: 14 });
+  button('go', mx + mw / 2 - 110, my + mh - 86, 220, 46, '开始游戏', { font: 19 });
+  ctx.textAlign = 'center'; ctx.font = '600 12px "PingFang SC",sans-serif'; ctx.fillStyle = '#79846f';
+  ctx.fillText('明棋：所有棋子兵种可见；行营安全、大本营锁定、地雷仅工兵可挖、炸弹同归于尽', W / 2, my + mh - 28);
+  ctx.restore();
+}
+function drawOver() {
+  const o = G.over; if (!o) return;
+  overlayScrim(0.55);
+  const mw = 420, mh = 220, mx = (W - mw) / 2, my = (H - mh) / 2;
+  roundRect(mx, my, mw, mh, 20);
+  ctx.fillStyle = '#252c23'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#5c6a56'; ctx.stroke();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = '800 30px "PingFang SC",sans-serif';
+  if (o.kind === 'win') {
+    ctx.fillStyle = o.team === 0 ? '#cfe0ff' : '#ffd9a8';
+    ctx.fillText(TEAM_NAME[o.team] + ' 胜利！', W / 2, my + 56);
+  } else {
+    ctx.fillStyle = '#d8e2cc';
+    ctx.fillText('和 棋', W / 2, my + 56);
+  }
+  ctx.font = '600 14px "PingFang SC",sans-serif'; ctx.fillStyle = '#9aa492';
+  ctx.fillText(`${G.modeName} · ${DIFFS[G.diff].name} · 共 ${G.ply} 手`, W / 2, my + 96);
+  button('again', mx + 40, my + mh - 74, (mw - 96) / 2, 44, '再来一局');
+  button('backmenu', mx + mw / 2 + 8, my + mh - 74, (mw - 96) / 2, 44, '回菜单', { dim: true });
+}
+function draw() {
+  hits = [];
+  const now = performance.now();
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#1b201a'); bg.addColorStop(1, '#0f120e');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  roundRect(BX - CELL * 0.78, BY - CELL * 0.78, CELL * 17.56, CELL * 17.56, 18);
+  ctx.fillStyle = '#242b21'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#3b453a'; ctx.stroke();
+  drawEdges(); drawNodes();
+  if (G.board) { drawMarkers(now); drawPieces(now); }
+  if (G.screen === 'menu') { overlayScrim(0.62); drawMenu(); }
+  else { drawPanel(now); if (G.over) drawOver(); }
+}
+
+// ---------- 输入 ----------
+function evPos(e) {
+  const rect = cv.getBoundingClientRect();
+  const t = (e.touches && e.touches[0]) || e;
+  return { x: (t.clientX - rect.left) * W / rect.width, y: (t.clientY - rect.top) * H / rect.height };
+}
+function hitButton(x, y) {
+  for (const h of hits) {
+    if (!h.disabled && x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h.id;
+  }
+  return null;
+}
+function nodeAt(x, y) {
+  let best = -1, bd = CELL * 0.62;
+  for (let n = 0; n < NODES.length; n++) {
+    const dx = PX(NODES[n].gx) - x, dy = PY(NODES[n].gy) - y;
+    const d = Math.hypot(dx, dy);
+    if (d < bd) { bd = d; best = n; }
+  }
+  return best;
+}
+function dispatch(id) {
+  if (id.startsWith('mode')) { G.menuSel.mode = +id.slice(4); return; }
+  if (id === 'go') { startMatch(MODES[G.menuSel.mode].id); return; }
+  if (id.startsWith('diff')) { applyDiff(+id.slice(4)); return; }
+  if (id === 'undo') { doUndo(); return; }
+  if (id === 'restart') { startMatch(currentKind()); return; }
+  if (id === 'menu' || id === 'backmenu') { G.screen = 'menu'; G.pendingAi = 0; G.over = null; return; }
+  if (id === 'sound') { G.sound = !G.sound; return; }
+  if (id === 'again') { startMatch(currentKind()); return; }
+}
+function onDown(e) {
+  e.preventDefault();
+  ac();
+  const { x, y } = evPos(e);
+  const id = hitButton(x, y);
+  if (id) { sfx.click(); dispatch(id); return; }
+  if (G.screen !== 'play' || G.over || G.anim || G.pendingAi) return;
+  if (!seatIsHuman(G.turn)) return;
+  const n = nodeAt(x, y);
+  if (n < 0) { G.sel = -1; G.legal = []; return; }
+  if (G.sel >= 0) {
+    const mv = G.legal.find(m => m.to === n);
+    if (mv) { applyMove(mv); return; }
+  }
+  const p = G.board[n];
+  if (p && pSide(p) === G.turn) {
+    G.sel = n;
+    G.legal = legalMoves(G.board, G.turn).filter(m => m.from === n);
+    if (!G.legal.length) sfx.deny();
+  } else {
+    G.sel = -1; G.legal = [];
+  }
+}
+cv.addEventListener('pointerdown', onDown);
+cv.addEventListener('pointermove', e => { mouse = evPos(e); });
+cv.addEventListener('pointerleave', () => { mouse = { x: -1, y: -1 }; });
+if (window.addEventListener) {
+  window.addEventListener('keydown', e => {
+    if (e.key === 'u' || e.key === 'U') doUndo();
+    else if (e.key === 'r' || e.key === 'R') { if (G.screen === 'play') startMatch(currentKind()); }
+  });
+}
+
+// ---------- 主循环 ----------
+function update() {
+  if (G.anim && performance.now() - G.anim.t0 >= 200) G.anim = null;
+  if (G.pendingAi && !G.anim && !G.over && performance.now() >= G.pendingAi) stepAiTurn();
+}
+function frame() {
+  update();
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function init() {
+  newGame();
+  G.screen = 'menu';
+}
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
