@@ -783,9 +783,11 @@ function drawPieces(now) {
 // ---------- 侧栏 / 面板 ----------
 function aliveCount(s) { let n = 0; for (const p of G.board) if (p && pSide(p) === s) n++; return n; }
 function drawPanel(now) {
+  // 棋盘背景框右缘/下缘 = BX/BY + CELL*16.78（见 draw() 的 roundRect），面板必须避开
+  const bR = BX + CELL * 16.78, bB = BY + CELL * 16.78;
   const P = PORTRAIT
-    ? { x: 26, y: BY + CELL * 16 + 18, w: W - 52, chipH: 34, gap: 6, logN: 6 }
-    : { x: BX + CELL * 16 + 26, y: 14, w: W - (BX + CELL * 16) - 40, chipH: 46, gap: 8, logN: 8 };
+    ? { x: 26, y: bB + 12, w: W - 52, chipH: 34, gap: 6, logN: 6 }
+    : { x: bR + 16, y: 14, w: W - bR - 36, chipH: 46, gap: 8, logN: 8 };
   ctx.save();
   ctx.textBaseline = 'middle';
   // 标题（横屏在棋盘上方，竖屏在顶栏）
