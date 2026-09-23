@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>合成大西瓜 · Suika H5</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #eaf6ee; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+// ============================================================
+// 合成大西瓜 H5 · 单文件 Canvas 2D · 零外部依赖
+// 规则：从顶部投放水果，相同水果相碰合成更大一档（11 档链：
+//       樱桃→草莓→葡萄→柠檬→橙子→苹果→梨→桃子→椰子→哈密瓜→大西瓜）；
+//       合成得分 = 新档位的三角形数（草莓+3 … 大西瓜+66）；
+//       两个大西瓜相碰双双消除 +100；
+//       任一水果顶部越过危险线并停留 2 秒即游戏结束；
+//       三档难度决定投放池最高档位（简单 3 种 / 普通 4 种 / 困难 5 种）；
+//       最高分按难度分别记录，难度选择持久化；
+//       对局中点左上角「菜单」按钮或按 Esc 可随时退出回菜单重选难度。
+// 物理：固定步长 1/120s，重力积分 + 5 次顺序迭代（位置修正 +
+//       低恢复系数冲量 + 切向摩擦），墙面/地板夹取，合成扫描在
+//       每步物理后执行并支持连锁（单步内反复合成直到稳定）。
+// 测试：node _test.js（无头断言物理/合成/连锁/危险线/计分/持久化）
+// ============================================================
+
+// ---- 常量 ----
+const BEST_KEY = 'suikabest';
+const DIFF_KEY = 'suikadiff';
+const COOLDOWN = 0.45;          // 两次投放最小间隔（秒）
+const DANGER_LIMIT = 2;         // 越线停留多少秒判负
+const ARM_DELAY = 0.6;          // 刚投放的水果宽限（秒），不计危险
+const DOUBLE_MELON_BONUS = 100; // 双西瓜消除奖励分
+const MERGE_PAD = 2;            // 接触判定容差（px×S）：圆心距 ≤ 半径和+容差即合成
+const REST = 0.05;              // 恢复系数（几乎不弹）
+const ITER = 5;                 // 每步碰撞迭代次数
+const WALL_RATIO = 0.022;       // 容器壁厚度 / BOX.w
+
+// 难度：只影响投放池的最高档位
+const DIFFS = {
+  easy:   { label: '简单', maxTier: 2 },
+  normal: { label: '普通', maxTier: 3 },
+  hard:   { label: '困难', maxTier: 4 },
+};
+const DIFF_ORDER = ['easy', 'normal', 'hard'];
+
+// 水果链：t = 半径比例（相对大西瓜），deco = 绘制细节类型
+const FRUITS = [
+  { id: 'cherry',      name: '樱桃',   rind: '#ef5350', rind2: '#b71c1c', juice: '#e53935', t: 0.176, deco: 'cherry' },
+  { id: 'strawberry',  name: '草莓',   rind: '#f06292', rind2: '#c2185b', juice: '#ec407a', t: 0.232, deco: 'seed' },
+  { id: 'grape',       name: '葡萄',   rind: '#9575cd', rind2: '#5e35b1', juice: '#7e57c2', t: 0.303, deco: 'lobes' },
+  { id: 'lemon',       name: '柠檬',   rind: '#ffee58', rind2: '#f9a825', juice: '#fdd835', t: 0.366, deco: 'tips' },
+  { id: 'orange',      name: '橙子',   rind: '#ffa726', rind2: '#e65100', juice: '#fb8c00', t: 0.423, deco: 'navel' },
+  { id: 'apple',       name: '苹果',   rind: '#e53935', rind2: '#8e1616', juice: '#ef5350', t: 0.507, deco: 'leaf' },
+  { id: 'pear',        name: '梨',     rind: '#dce775', rind2: '#9e9d24', juice: '#c0ca33', t: 0.584, deco: 'speck' },
+  { id: 'peach',       name: '桃子',   rind: '#ffab91', rind2: '#e64a19', juice: '#ff8a65', t: 0.669, deco: 'cleft' },
+  { id: 'coconut',     name: '椰子',   rind: '#8d6e63', rind2: '#4e342e', juice: '#6d4c41', t: 0.760, deco: 'holes' },
+  { id: 'melon',       name: '哈密瓜', rind: '#c5e1a5', rind2: '#7cb342', juice: '#9ccc65', t: 0.845, deco: 'net' },
+  { id: 'watermelon',  name: '大西瓜', rind: '#4caf50', rind2: '#1b5e20', juice: '#43a047', t: 1.000, deco: 'stripe' },
+];
+const TOP_TIER = FRUITS.length - 1;
+// 投放权重：低档多、高档少（截断到难度池后归一）
+const SPAWN_W = [30, 24, 20, 14, 12];
+// 合成计分：新档位的三角形数（1 档草莓 +3，10 档大西瓜 +66）
+function SC(tier) { return (tier + 1) * (tier + 2) / 2; }
+
+// ---- 运行时状态 ----
+let W = 0, H = 0, DPR = 1, S = 1;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const BOX = { x: 0, y: 0, w: 0, h: 0, wall: 0 };  // 容器（玻璃罐）
+
+const G = {
+  screen: 'menu',        // 'menu' | 'play' | 'over'
+  score: 0,
+  bestMap: { easy: 0, normal: 0, hard: 0 },
+  diff: 'normal',
+  fruits: [], particles: [], flashes: [], popups: [], confetti: [],
+  current: 0, next: 0,
+  aimX: 0, dragging: false,
+  cooldown: 0,
+  danger: 0,             // 已越线累计秒数
+  lastWarn: -1,          // 危险提示音节流
+  mergedTotal: 0,        // 本局合成次数（含连锁）
+  overReason: '',
+  newBest: false,
+  prevBest: 0,
+  mute: false,
+};
+
+// ---- 尺寸与缩放 ----
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  S = H / 800;
+  BOX.w = H >= W ? Math.min(W - 28 * S, H * 0.6) : Math.min(W * 0.42, H * 0.74);
+  BOX.w = Math.max(200, Math.min(BOX.w, W - 28 * S));
+  BOX.x = (W - BOX.w) / 2;
+  BOX.y = H * 0.115;
+  BOX.h = H - 34 * S - BOX.y;
+  BOX.wall = Math.max(4, BOX.w * WALL_RATIO);
+  G.aimX = Math.min(Math.max(G.aimX || W / 2, innerLeft() + 20), innerRight() - 20);
+}
+function innerLeft() { return BOX.x + BOX.wall; }
+function innerRight() { return BOX.x + BOX.w - BOX.wall; }
+function floorY() { return BOX.y + BOX.h - BOX.wall; }
+function deathY() { return BOX.y + Math.min(96 * S, BOX.h * 0.16); }
+function gravity() { return 2600 * S; }
+function fruitRadius(tier) { return Math.max(11 * S, BOX.w * 0.222 * FRUITS[tier].t); }
+
+// ---- 音频（Web Audio 合成，无外部文件）----
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(type, f0, f1, dur, vol, delay) {
+  const ac = audio(); if (!ac || G.mute) return;
+  const t0 = ac.currentTime + (delay || 0);
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t0);
+  if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.015);
+  g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+  o.connect(g); g.connect(ac.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function sfxDrop() { tone('sine', 420, 170, 0.1, 0.14); }
+function sfxMerge(tier) { const f = 200 * Math.pow(1.16, tier); tone('triangle', f, f * 1.5, 0.13, 0.2); }
+function sfxChain() { [660, 880, 1100].forEach((hz, i) => tone('triangle', hz, hz, 0.14, 0.18, i * 0.06)); }
+function sfxBonus() { [523, 659, 784, 1046].forEach((hz, i) => tone('triangle', hz, hz, 0.18, 0.2, i * 0.07)); }
+function sfxWarn() { tone('square', 880, 880, 0.07, 0.06); }
+function sfxOver() { tone('sawtooth', 320, 70, 0.5, 0.16); }
+
+// ---- 工具 ----
+function rand(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+function randomTier() {
+  const m = DIFFS[G.diff].maxTier;
+  let total = 0; const w = [];
+  for (let i = 0; i <= m; i++) { w.push(SPAWN_W[i]); total += SPAWN_W[i]; }
+  let r = Math.random() * total;
+  for (let i = 0; i <= m; i++) { r -= w[i]; if (r < 0) return i; }
+  return m;
+}
+
+function mkFruit(tier, x, y, vx, vy) {
+  return { tier, x, y, vx: vx || 0, vy: vy || 0, r: fruitRadius(tier), rot: rand(0, 6.28), age: 0 };
+}
+
+// ---- 投放 ----
+function dropFruit() {
+  if (G.screen !== 'play' || G.cooldown > 0) return false;
+  const r = fruitRadius(G.current);
+  const x = clamp(G.aimX, innerLeft() + r, innerRight() - r);
+  G.fruits.push(mkFruit(G.current, x, deathY(), 0, 80 * S));
+  G.cooldown = COOLDOWN;
+  G.current = G.next; G.next = randomTier();
+  sfxDrop();
+  return true;
+}
+
+// ---- 合成 ----
+function mergePair(a, b) {
+  for (const e of [a, b]) { const i = G.fruits.indexOf(e); if (i >= 0) G.fruits.splice(i, 1); }
+  const t = a.tier, x = (a.x + b.x) / 2, y = (a.y + b.y) / 2;
+  if (t >= TOP_TIER) {                              // 双瓜同归
+    G.score += DOUBLE_MELON_BONUS;
+    G.popups.push({ x, y: y - 20 * S, text: '双瓜消除 +' + DOUBLE_MELON_BONUS, color: '#c62828', size: 30, life: 1.4, t: 0 });
+    burst(x, y, FRUITS[t].juice, 26, 460);
+    confettiBurst(x, y);
+    G.flashes.push({ x, y, r: fruitRadius(t) * 2.2, t: 0, life: 0.35, color: 'rgba(255,235,59,' });
+    sfxBonus();
+  } else {
+    const nt = t + 1;
+    const f = mkFruit(nt, x, y, (a.vx + b.vx) * 0.2, (a.vy + b.vy) * 0.2);
+    f.x = clamp(f.x, innerLeft() + f.r, innerRight() - f.r);
+    f.y = Math.min(f.y, floorY() - f.r);
+    G.fruits.push(f);
+    G.score += SC(nt);
+    G.popups.push({ x, y: y - f.r - 8 * S, text: '+' + SC(nt), color: FRUITS[nt].rind2, size: 18 + nt, life: 0.8, t: 0 });
+    burst(x, y, FRUITS[nt].juice, 8 + nt, 220 + nt * 18);
+    G.flashes.push({ x, y, r: f.r * 1.7, t: 0, life: 0.28, color: 'rgba(255,255,255,' });
+    sfxMerge(nt);
+  }
+  G.mergedTotal++;
+}
+// 反复扫描直到无可合成对（连锁）；返回本次合成次数
+function tryMergeAll() {
+  let count = 0, lastX = 0, lastY = 0;
+  for (let pass = 0; pass < 96; pass++) {   // 上限防死循环；密集堆叠级联也够用
+    const fs = G.fruits;
+    let pair = null;
+    for (let i = 0; i < fs.length && !pair; i++) {
+      for (let j = i + 1; j < fs.length; j++) {
+        const a = fs[i], b = fs[j];
+        if (a.tier !== b.tier) continue;
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (d <= a.r + b.r + MERGE_PAD * S) { pair = [a, b]; break; }
+      }
+    }
+    if (!pair) break;
+    lastX = (pair[0].x + pair[1].x) / 2; lastY = (pair[0].y + pair[1].y) / 2;
+    mergePair(pair[0], pair[1]);
+    count++;
+  }
+  if (count >= 2) {
+    G.popups.push({ x: lastX, y: lastY - 46 * S, text: '连锁 x' + count, color: '#ef6c00', size: 26, life: 1.1, t: 0 });
+    sfxChain();
+  }
+  return count;
+}
+
+// ---- 粒子 / 特效 ----
+function burst(x, y, color, n, sp) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), v = rand(0.35, 1) * sp * S;
+    G.particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 60 * S, r: rand(2, 5) * S, color, life: rand(0.35, 0.7), t: 0 });
+  }
+}
+function confettiBurst(x, y) {
+  for (let i = 0; i < 36; i++) {
+    const a = rand(0, Math.PI * 2), v = rand(0.3, 1) * 520 * S;
+    G.confetti.push({
+      x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 160 * S,
+      w: rand(5, 10) * S, h: rand(3, 6) * S, rot: rand(0, 6.28), vrot: rand(-8, 8),
+      color: ['#ef5350', '#ffca28', '#43a047', '#42a5f5', '#ab47bc'][i % 5], life: rand(0.8, 1.5), t: 0,
+    });
+  }
+}
+
+// ---- 物理 ----
+function step(dt) {
+  const g = gravity(), fs = G.fruits;
+  const L = innerLeft(), R = innerRight(), F = floorY();
+  for (const e of fs) {
+    e.age += dt;
+    e.vy += g * dt;
+    e.vx *= Math.pow(0.6, dt);
+    e.x += e.vx * dt; e.y += e.vy * dt;
+    e.rot += e.vx * dt / e.r * 1.2;
+  }
+  for (let it = 0; it < ITER; it++) {
+    for (const e of fs) {
+      if (e.x - e.r < L) { e.x = L + e.r; if (e.vx < 0) e.vx = -e.vx * REST; }
+      if (e.x + e.r > R) { e.x = R - e.r; if (e.vx > 0) e.vx = -e.vx * REST; }
+      if (e.y + e.r > F) {
+        e.y = F - e.r;
+        if (e.vy > 0) e.vy = -e.vy * REST;
+        e.vx *= 0.9;
+      }
+    }
+    for (let i = 0; i < fs.length; i++) {
+      for (let j = i + 1; j < fs.length; j++) {
+        const a = fs[i], b = fs[j];
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d = Math.hypot(dx, dy);
+        const min = a.r + b.r;
+        if (d >= min) continue;
+        if (d < 0.0001) { dx = rand(-1, 1); dy = -1; d = Math.hypot(dx, dy); }
+        const nx = dx / d, ny = dy / d, pen = min - d;
+        const ma = a.r * a.r, mb = b.r * b.r, mt = ma + mb;
+        const ca = mb / mt * 0.85, cb = ma / mt * 0.85;
+        a.x -= nx * pen * ca; a.y -= ny * pen * ca;
+        b.x += nx * pen * cb; b.y += ny * pen * cb;
+        const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+        const vn = rvx * nx + rvy * ny;
+        if (vn < 0) {
+          const imp = -(1 + REST) * vn / (1 / ma + 1 / mb);
+          a.vx -= imp * nx / ma; a.vy -= imp * ny / ma;
+          b.vx += imp * nx / mb; b.vy += imp * ny / mb;
+          const tx = -ny, ty = nx;
+          const vt = (b.vx - a.vx) * tx + (b.vy - a.vy) * ty;
+          a.vx += vt * 0.06 * tx; a.vy += vt * 0.06 * ty;
+          b.vx -= vt * 0.06 * tx; b.vy -= vt * 0.06 * ty;
+        }
+      }
+    }
+  }
+}
+
+// ---- 局流程 ----
+function resetGame() {
+  G.score = 0; G.fruits.length = 0; G.particles.length = 0;
+  G.flashes.length = 0; G.popups.length = 0; G.confetti.length = 0;
+  G.cooldown = 0.5; G.danger = 0; G.lastWarn = -1; G.mergedTotal = 0;
+  G.overReason = ''; G.newBest = false; G.dragging = false;
+  G.current = randomTier(); G.next = randomTier();
+  G.aimX = W / 2;
+}
+function startGame() { resetGame(); G.screen = 'play'; }
+function bestNow() { return G.bestMap[G.diff] || 0; }
+// 对局中主动退出回菜单：结算最高分并清空局面（可重选难度再开局）
+function quitToMenu() {
+  if (G.screen !== 'play') return;
+  if (G.score > bestNow()) { G.bestMap[G.diff] = G.score; saveBest(); }
+  G.screen = 'menu'; G.dragging = false;
+  G.fruits.length = 0; G.particles.length = 0; G.confetti.length = 0;
+  G.flashes.length = 0; G.popups.length = 0; G.danger = 0;
+}
+function endGame(reason) {
+  if (G.screen !== 'play') return;
+  G.overReason = reason; G.screen = 'over';
+  sfxOver();
+  if (G.score > bestNow()) { G.prevBest = bestNow(); G.bestMap[G.diff] = G.score; G.newBest = true; saveBest(); }
+}
+function loadBest() {
+  try {
+    const raw = localStorage.getItem(BEST_KEY);
+    if (!raw) return;
+    const o = JSON.parse(raw);
+    if (typeof o === 'number' && o > 0) G.bestMap.normal = o | 0;   // 兼容旧版单一纪录
+    else if (o && typeof o === 'object')
+      for (const k of DIFF_ORDER) if (o[k] > 0) G.bestMap[k] = o[k] | 0;
+  } catch (e) {}
+}
+function saveBest() { try { localStorage.setItem(BEST_KEY, JSON.stringify(G.bestMap)); } catch (e) {} }
+function loadDiff() {
+  try { const d = localStorage.getItem(DIFF_KEY); if (d && DIFFS[d]) G.diff = d; } catch (e) {}
+}
+function setDiff(d) {
+  if (!DIFFS[d]) return;
+  G.diff = d;
+  try { localStorage.setItem(DIFF_KEY, d); } catch (e) {}
+}
+
+// ---- 更新 ----
+function update(dt) {
+  if (G.screen === 'play') {
+    G.cooldown = Math.max(0, G.cooldown - dt);
+    step(dt);
+    // 夹取放在合成扫描之前：避免夹取动作制造"同档刚接触"的瞬态漏合成
+    for (const e of G.fruits) {
+      if (e.x - e.r < innerLeft()) e.x = innerLeft() + e.r;
+      if (e.x + e.r > innerRight()) e.x = innerRight() - e.r;
+      if (e.y + e.r > floorY()) e.y = floorY() - e.r;
+    }
+    tryMergeAll();
+    let over = false;
+    for (const e of G.fruits) {
+      if (e.age > ARM_DELAY && e.y - e.r < deathY()) { over = true; break; }
+    }
+    if (over) {
+      G.danger += dt;
+      const w = Math.floor(G.danger);
+      if (w > G.lastWarn && G.danger < DANGER_LIMIT) { G.lastWarn = w; sfxWarn(); }
+      if (G.danger >= DANGER_LIMIT) endGame('overflow');
+    } else {
+      G.danger = Math.max(0, G.danger - dt * 2);
+      if (G.danger === 0) G.lastWarn = -1;
+    }
+  } else {
+    step(dt);   // 结算界面保留堆叠动画
+  }
+  const g = gravity();
+  for (const p of G.particles) { p.t += dt; p.vy += g * 0.8 * dt; p.x += p.vx * dt; p.y += p.vy * dt; }
+  for (let i = G.particles.length - 1; i >= 0; i--) if (G.particles[i].t >= G.particles[i].life) G.particles.splice(i, 1);
+  for (const c of G.confetti) { c.t += dt; c.vy += g * 0.5 * dt; c.vx *= Math.pow(0.4, dt); c.x += c.vx * dt; c.y += c.vy * dt; c.rot += c.vrot * dt; }
+  for (let i = G.confetti.length - 1; i >= 0; i--) if (G.confetti[i].t >= G.confetti[i].life) G.confetti.splice(i, 1);
+  for (const f of G.flashes) f.t += dt;
+  for (let i = G.flashes.length - 1; i >= 0; i--) if (G.flashes[i].t >= G.flashes[i].life) G.flashes.splice(i, 1);
+  for (const p of G.popups) { p.t += dt; p.y -= 40 * S * dt; }
+  for (let i = G.popups.length - 1; i >= 0; i--) if (G.popups[i].t >= G.popups[i].life) G.popups.splice(i, 1);
+}
+
+// ---- 绘制：水果 ----
+function drawFruit(tier, x, y, r, rot, alpha) {
+  const def = FRUITS[tier];
+  ctx.save();
+  if (alpha !== undefined) ctx.globalAlpha = alpha;
+  ctx.translate(x, y); ctx.rotate(rot || 0);
+  const rg = ctx.createRadialGradient(-r * 0.35, -r * 0.4, r * 0.15, 0, 0, r * 1.05);
+  rg.addColorStop(0, def.rind); rg.addColorStop(1, def.rind2);
+  ctx.fillStyle = rg;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.14)'; ctx.lineWidth = Math.max(1, r * 0.05);
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.97, 0, Math.PI * 2); ctx.stroke();
+  const hi = 'rgba(255,255,255,0.5)';
+  switch (def.deco) {
+    case 'cherry':
+      ctx.fillStyle = hi;
+      ctx.beginPath(); ctx.ellipse(-r * 0.35, -r * 0.45, r * 0.22, r * 0.13, -0.6, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#5d4037'; ctx.lineWidth = r * 0.1;
+      ctx.beginPath(); ctx.moveTo(0, -r * 0.85); ctx.quadraticCurveTo(r * 0.5, -r * 1.5, r * 0.9, -r * 1.3); ctx.stroke();
+      break;
+    case 'seed':
+      ctx.fillStyle = '#fff59d';
+      for (let i = 0; i < 8; i++) {
+        const a = i / 8 * Math.PI * 2 + 0.4, d = r * (0.35 + (i % 3) * 0.18);
+        ctx.beginPath(); ctx.ellipse(Math.cos(a) * d, Math.sin(a) * d, r * 0.06, r * 0.1, a, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = '#66bb6a';
+      ctx.beginPath(); ctx.ellipse(0, -r * 0.85, r * 0.35, r * 0.14, 0, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 'lobes':
+      ctx.fillStyle = 'rgba(255,255,255,0.22)';
+      [[-0.35, -0.15], [0.32, -0.05], [-0.02, 0.4], [0.05, -0.5]].forEach(p => {
+        ctx.beginPath(); ctx.arc(p[0] * r, p[1] * r, r * 0.34, 0, Math.PI * 2); ctx.fill();
+      });
+      ctx.strokeStyle = '#33691e'; ctx.lineWidth = r * 0.09;
+      ctx.beginPath(); ctx.moveTo(0, -r * 0.9); ctx.lineTo(0, -r * 1.25); ctx.stroke();
+      break;
+    case 'tips':
+      ctx.fillStyle = def.rind2;
+      ctx.beginPath(); ctx.ellipse(-r * 0.96, 0, r * 0.14, r * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(r * 0.96, 0, r * 0.14, r * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = hi;
+      ctx.beginPath(); ctx.ellipse(-r * 0.3, -r * 0.45, r * 0.3, r * 0.15, -0.5, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 'navel':
+      ctx.fillStyle = 'rgba(120,60,0,0.45)';
+      ctx.beginPath(); ctx.arc(r * 0.15, r * 0.35, r * 0.1, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#2e7d32';
+      ctx.beginPath(); ctx.ellipse(-r * 0.1, -r * 0.95, r * 0.28, r * 0.12, -0.35, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = hi;
+      ctx.beginPath(); ctx.ellipse(-r * 0.35, -r * 0.4, r * 0.25, r * 0.12, -0.6, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 'leaf':
+      ctx.strokeStyle = '#5d4037'; ctx.lineWidth = r * 0.08;
+      ctx.beginPath(); ctx.moveTo(0, -r * 0.85); ctx.lineTo(r * 0.08, -r * 1.18); ctx.stroke();
+      ctx.fillStyle = '#43a047';
+      ctx.beginPath(); ctx.ellipse(r * 0.3, -r * 1.05, r * 0.3, r * 0.12, -0.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = hi;
+      ctx.beginPath(); ctx.ellipse(-r * 0.35, -r * 0.42, r * 0.28, r * 0.14, -0.6, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 'speck':
+      ctx.fillStyle = 'rgba(110,90,20,0.4)';
+      for (let i = 0; i < 9; i++) {
+        const a = i * 2.4, d = r * (0.25 + (i * 37 % 50) / 100);
+        ctx.beginPath(); ctx.arc(Math.cos(a) * d, Math.sin(a) * d, r * 0.045, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = '#8d6e63';
+      ctx.beginPath(); ctx.ellipse(0, -r * 0.92, r * 0.16, r * 0.09, 0, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 'cleft':
+      ctx.strokeStyle = 'rgba(190,60,60,0.55)'; ctx.lineWidth = r * 0.08;
+      ctx.beginPath(); ctx.moveTo(-r * 0.5, -r * 0.75);
+      ctx.quadraticCurveTo(-r * 0.1, 0, -r * 0.45, r * 0.8); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,120,120,0.4)';
+      ctx.beginPath(); ctx.arc(r * 0.35, r * 0.2, r * 0.4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = hi;
+      ctx.beginPath(); ctx.ellipse(-r * 0.2, -r * 0.5, r * 0.24, r * 0.12, -0.5, 0, Math.PI * 2); ctx.fill();
+      break;
+    case 'holes':
+      ctx.fillStyle = '#3e2723';
+      [[-0.25, -0.3], [0.25, -0.3], [0, 0.05]].forEach(p => {
+        ctx.beginPath(); ctx.arc(p[0] * r, p[1] * r, r * 0.11, 0, Math.PI * 2); ctx.fill();
+      });
+      ctx.strokeStyle = 'rgba(62,39,35,0.5)'; ctx.lineWidth = r * 0.05;
+      for (let i = 0; i < 5; i++) {
+        ctx.beginPath(); ctx.arc(0, r * 0.4, r * (0.55 + i * 0.1), -2.4, -0.7); ctx.stroke();
+      }
+      break;
+    case 'net':
+      ctx.strokeStyle = 'rgba(90,120,40,0.5)'; ctx.lineWidth = Math.max(1, r * 0.04);
+      for (let i = -2; i <= 2; i++) {
+        ctx.beginPath(); ctx.arc(0, 0, r * (0.2 + Math.abs(i) * 0.2), 0, Math.PI * 2); ctx.stroke();
+      }
+      for (let i = 0; i < 4; i++) {
+        const a = i * Math.PI / 4;
+        ctx.beginPath(); ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
+        ctx.lineTo(-Math.cos(a) * r, -Math.sin(a) * r); ctx.stroke();
+      }
+      break;
+    case 'stripe':
+      ctx.strokeStyle = 'rgba(15,60,25,0.85)'; ctx.lineWidth = r * 0.14;
+      [-0.6, -0.22, 0.22, 0.6].forEach(k => {
+        ctx.beginPath(); ctx.ellipse(0, 0, r * Math.abs(k) + r * 0.02, r * 0.96, 0, 0, Math.PI * 2); ctx.stroke();
+      });
+      ctx.fillStyle = hi;
+      ctx.beginPath(); ctx.ellipse(-r * 0.35, -r * 0.5, r * 0.2, r * 0.1, -0.6, 0, Math.PI * 2); ctx.fill();
+      break;
+  }
+  ctx.restore();
+}
+
+// ---- 绘制：场景 ----
+function drawBackground() {
+  const gr = ctx.createLinearGradient(0, 0, 0, H);
+  gr.addColorStop(0, '#cdeef5'); gr.addColorStop(0.55, '#eaf6ee'); gr.addColorStop(1, '#f6e8c9');
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, W, H);
+  const rg = ctx.createRadialGradient(W * 0.5, H * 0.25, 10, W * 0.5, H * 0.25, Math.max(W, H) * 0.7);
+  rg.addColorStop(0, 'rgba(255,241,150,0.25)'); rg.addColorStop(1, 'rgba(255,241,150,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+  // 桌沿
+  ctx.fillStyle = '#c9a06a'; ctx.fillRect(0, H - 34 * S, W, 34 * S);
+  ctx.fillStyle = 'rgba(0,0,0,0.12)'; ctx.fillRect(0, H - 34 * S, W, 4 * S);
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function drawBox() {
+  // 罐内（半透明玻璃）
+  ctx.save();
+  roundRect(BOX.x, BOX.y, BOX.w, BOX.h, BOX.w * 0.09);
+  ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fill();
+  ctx.clip();
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillRect(BOX.x + BOX.w * 0.08, BOX.y, BOX.w * 0.05, BOX.h);   // 竖向高光条
+  ctx.restore();
+  // 壁
+  ctx.lineWidth = BOX.wall;
+  ctx.strokeStyle = '#8fd0c5';
+  roundRect(BOX.x + BOX.wall / 2, BOX.y + BOX.wall / 2, BOX.w - BOX.wall, BOX.h - BOX.wall / 2, BOX.w * 0.085);
+  ctx.stroke();
+  ctx.lineWidth = Math.max(1, BOX.wall * 0.3);
+  ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+  roundRect(BOX.x + BOX.wall * 1.6, BOX.y + BOX.wall * 1.6, BOX.w - BOX.wall * 3.2, BOX.h - BOX.wall * 2.4, BOX.w * 0.07);
+  ctx.stroke();
+  // 危险线
+  const dy = deathY();
+  const pulse = G.danger > 0 ? 0.45 + 0.4 * Math.sin(performance.now() / 90) : 0.4;
+  ctx.save();
+  ctx.setLineDash([10 * S, 8 * S]);
+  ctx.strokeStyle = G.danger > 0 ? 'rgba(229,57,53,' + pulse + ')' : 'rgba(229,57,53,0.35)';
+  ctx.lineWidth = 2.5 * S;
+  ctx.beginPath(); ctx.moveTo(innerLeft(), dy); ctx.lineTo(innerRight(), dy); ctx.stroke();
+  ctx.restore();
+  // 危险进度小条
+  if (G.danger > 0.05 && G.screen === 'play') {
+    const p = Math.min(1, G.danger / DANGER_LIMIT);
+    const bw = 8 * S, bx = Math.min(BOX.x + BOX.w + 12 * S, W - bw - 4 * S), by = BOX.y + 10 * S, bh = 90 * S;
+    ctx.fillStyle = 'rgba(0,0,0,0.12)'; roundRect(bx, by, bw, bh, bw / 2); ctx.fill();
+    ctx.fillStyle = p > 0.6 ? '#d32f2f' : '#ef6c00'; roundRect(bx, by + bh * (1 - p), bw, bh * p, bw / 2); ctx.fill();
+    ctx.save();
+    ctx.font = '700 ' + Math.round(11 * S) + 'px sans-serif';
+    ctx.fillStyle = '#c62828'; ctx.textAlign = 'center';
+    ctx.fillText('危险', bx + bw / 2, by - 6 * S);
+    ctx.restore();
+  }
+}
+function drawDropper() {
+  if (G.screen !== 'play') return;
+  const r = fruitRadius(G.current);
+  const x = clamp(G.aimX, innerLeft() + r, innerRight() - r);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(93,64,55,0.6)'; ctx.lineWidth = 2 * S;
+  ctx.setLineDash([5 * S, 4 * S]);
+  ctx.beginPath(); ctx.moveTo(x, BOX.y); ctx.lineTo(x, deathY() - r); ctx.stroke();
+  ctx.restore();
+  drawFruit(G.current, x, deathY(), r, 0, 0.9);
+}
+function drawFx() {
+  for (const f of G.flashes) {
+    const a = 1 - f.t / f.life;
+    ctx.fillStyle = f.color + (a * 0.6) + ')';
+    ctx.beginPath(); ctx.arc(f.x, f.y, f.r * (0.6 + 0.6 * (f.t / f.life)), 0, Math.PI * 2); ctx.fill();
+  }
+  for (const p of G.particles) {
+    ctx.globalAlpha = Math.max(0, 1 - p.t / p.life);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const c of G.confetti) {
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, 1 - c.t / c.life);
+    ctx.translate(c.x, c.y); ctx.rotate(c.rot);
+    ctx.fillStyle = c.color; ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+    ctx.restore();
+  }
+}
+function drawPopups() {
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const p of G.popups) {
+    const a = 1 - p.t / p.life;
+    ctx.globalAlpha = Math.max(0, a);
+    ctx.font = '800 ' + Math.round(p.size * S) + 'px sans-serif';
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)'; ctx.lineWidth = 3 * S;
+    ctx.strokeText(p.text, p.x, p.y);
+    ctx.fillStyle = p.color; ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.restore();
+}
+function drawHUD() {
+  if (G.screen !== 'play') return;
+  drawButton('quit', '菜单', 14 * S + 30 * S, 14 * S + 16 * S, 60 * S, 32 * S, false);
+  ctx.save();
+  ctx.textBaseline = 'top';
+  ctx.font = '800 ' + Math.round(30 * S) + 'px sans-serif';
+  ctx.fillStyle = '#2d3142';
+  ctx.fillText(G.score, 88 * S, 14 * S);
+  ctx.font = '600 ' + Math.round(12 * S) + 'px sans-serif';
+  ctx.fillStyle = 'rgba(45,49,66,0.6)';
+  ctx.fillText('得分 · ' + DIFFS[G.diff].label + ' · 最高 ' + bestNow(), 88 * S, 52 * S);
+  // 下一个水果预览（右上）
+  const pw = 64 * S, px = W - pw - 14 * S, py = 14 * S;
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.strokeStyle = 'rgba(45,49,66,0.15)'; ctx.lineWidth = 1.5 * S;
+  roundRect(px, py, pw, pw, 14 * S); ctx.fill(); ctx.stroke();
+  ctx.font = '600 ' + Math.round(10 * S) + 'px sans-serif';
+  ctx.fillStyle = 'rgba(45,49,66,0.55)'; ctx.textAlign = 'center';
+  ctx.fillText('下一个', px + pw / 2, py + 5 * S);
+  drawFruit(G.next, px + pw / 2, py + pw * 0.58, pw * 0.32, 0);
+  ctx.restore();
+}
+// 按钮：返回命中矩形
+const BTN = {};
+function drawButton(id, label, cx, cy, w, h, main) {
+  const x = cx - w / 2, y = cy - h / 2;
+  BTN[id] = { x, y, w, h };
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.2)'; ctx.shadowOffsetY = 4 * S;
+  ctx.fillStyle = main ? '#43a047' : 'rgba(255,255,255,0.75)';
+  roundRect(x, y, w, h, h / 2); ctx.fill();
+  ctx.shadowColor = 'transparent';
+  if (!main) { ctx.strokeStyle = 'rgba(45,49,66,0.25)'; ctx.lineWidth = 1.5 * S; roundRect(x, y, w, h, h / 2); ctx.stroke(); }
+  ctx.fillStyle = main ? '#fff' : '#2d3142';
+  ctx.font = '700 ' + Math.round(h * 0.42) + 'px sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, cx, cy + 1);
+  ctx.restore();
+}
+function hitBtn(px, py) {
+  for (const id of Object.keys(BTN)) {
+    const b = BTN[id];
+    if (b && px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return id;
+  }
+  return null;
+}
+function drawTitleMelon() {
+  const r = Math.min(W, H) * 0.15, x = W / 2, y = H * 0.22;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(-0.12);
+  ctx.fillStyle = '#1b5e20';
+  ctx.beginPath(); ctx.arc(0, 0, r, Math.PI, Math.PI * 2); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#a5d6a7';
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.99, Math.PI + 0.1, Math.PI * 2 - 0.1); ctx.closePath(); ctx.fill();
+  const rg = ctx.createRadialGradient(0, -r * 0.2, r * 0.1, 0, 0, r * 0.88);
+  rg.addColorStop(0, '#ff8a80'); rg.addColorStop(1, '#e53935');
+  ctx.fillStyle = rg;
+  ctx.beginPath(); ctx.arc(0, 0, r * 0.85, Math.PI, Math.PI * 2); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = '#33211c';
+  for (let i = 0; i < 7; i++) {
+    const a = Math.PI + (i + 0.7) / 8.4 * Math.PI, d = r * (0.35 + (i % 2) * 0.3);
+    ctx.beginPath(); ctx.ellipse(Math.cos(a) * d, Math.sin(a) * d, r * 0.05, r * 0.085, a + Math.PI / 2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawMenu() {
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  drawTitleMelon();
+  ctx.fillStyle = '#2d3142';
+  ctx.font = '900 ' + Math.round(Math.min(W * 0.1, 60 * S)) + 'px sans-serif';
+  ctx.fillText('合成大西瓜', W / 2, H * 0.42);
+  ctx.font = '600 ' + Math.round(14 * S) + 'px sans-serif';
+  ctx.fillStyle = 'rgba(45,49,66,0.55)';
+  ctx.fillText('SUIKA · 相同水果相碰合成更大', W / 2, H * 0.42 + 38 * S);
+  ctx.fillStyle = 'rgba(45,49,66,0.8)';
+  ctx.font = '500 ' + Math.round(14 * S) + 'px sans-serif';
+  ctx.fillText('移动瞄准 · 松手投放 · 樱桃一路合成到大西瓜', W / 2, H * 0.42 + 66 * S);
+  ctx.fillText('水果顶越过危险线停留 ' + DANGER_LIMIT + ' 秒即结束', W / 2, H * 0.42 + 90 * S);
+  ctx.restore();
+  // 难度三选
+  const cw = Math.min(96 * S, (W - 48 * S) / 3), ch = 38 * S, cy = H * 0.6;
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  DIFF_ORDER.forEach((id, i) => {
+    const cx = W / 2 + (i - 1) * (cw + 12 * S);
+    const sel = G.diff === id;
+    BTN['diff_' + id] = { x: cx - cw / 2, y: cy - ch / 2, w: cw, h: ch };
+    ctx.fillStyle = sel ? '#43a047' : 'rgba(255,255,255,0.7)';
+    roundRect(cx - cw / 2, cy - ch / 2, cw, ch, ch / 2); ctx.fill();
+    if (!sel) { ctx.strokeStyle = 'rgba(45,49,66,0.2)'; ctx.lineWidth = 1.5 * S; roundRect(cx - cw / 2, cy - ch / 2, cw, ch, ch / 2); ctx.stroke(); }
+    ctx.fillStyle = sel ? '#fff' : 'rgba(45,49,66,0.7)';
+    ctx.font = '700 ' + Math.round(15 * S) + 'px sans-serif';
+    ctx.fillText(DIFFS[id].label, cx, cy + 1);
+  });
+  ctx.font = '500 ' + Math.round(11 * S) + 'px sans-serif';
+  ctx.fillStyle = 'rgba(45,49,66,0.5)';
+  ctx.fillText('投放池最高 ' + FRUITS[DIFFS[G.diff].maxTier].name + '（前 ' + (DIFFS[G.diff].maxTier + 1) + ' 档随机）', W / 2, cy + ch);
+  ctx.restore();
+  drawButton('start', '开 始 游 戏', W / 2, H * 0.72, Math.min(260 * S, W * 0.6), 58 * S, true);
+  ctx.save(); ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(45,49,66,0.55)';
+  ctx.font = '600 ' + Math.round(13 * S) + 'px sans-serif';
+  ctx.fillText('「' + DIFFS[G.diff].label + '」历史最高 ' + bestNow() + ' 分 · 按 M 静音', W / 2, H * 0.72 + 56 * S);
+  ctx.restore();
+}
+function drawOver() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(250,245,230,0.72)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#2d3142';
+  ctx.font = '900 ' + Math.round(40 * S) + 'px sans-serif';
+  ctx.fillText('游戏结束', W / 2, H * 0.3);
+  ctx.font = '600 ' + Math.round(16 * S) + 'px sans-serif';
+  ctx.fillStyle = '#c62828';
+  ctx.fillText('水果溢出危险线了！', W / 2, H * 0.3 + 40 * S);
+  ctx.fillStyle = '#ef6c00';
+  ctx.font = '900 ' + Math.round(56 * S) + 'px sans-serif';
+  ctx.fillText(G.score, W / 2, H * 0.48);
+  ctx.font = '600 ' + Math.round(14 * S) + 'px sans-serif';
+  ctx.fillStyle = 'rgba(45,49,66,0.7)';
+  ctx.fillText((G.newBest ? '★ 新纪录！之前的最高 ' + G.prevBest + ' 分' : '「' + DIFFS[G.diff].label + '」最高分 ' + bestNow())
+    + ' · 本局合成 ' + G.mergedTotal + ' 次', W / 2, H * 0.48 + 44 * S);
+  ctx.restore();
+  drawButton('again', '再 来 一 局', W / 2, H * 0.64, Math.min(260 * S, W * 0.6), 58 * S, true);
+  drawButton('menu', '回主菜单', W / 2, H * 0.64 + 76 * S, Math.min(260 * S, W * 0.6), 46 * S, false);
+}
+function drawScene() {
+  for (const k of Object.keys(BTN)) delete BTN[k];   // 每帧重建按钮命中区
+  drawBackground();
+  drawBox();
+  for (const e of G.fruits) drawFruit(e.tier, e.x, e.y, e.r, e.rot);
+  drawFx();
+  drawDropper();
+  drawPopups();
+  drawHUD();
+  if (G.screen === 'menu') drawMenu();
+  if (G.screen === 'over') drawOver();
+}
+
+// ---- 输入 ----
+function localXY(ev) {
+  const rect = canvas.getBoundingClientRect();
+  const p = ev.touches && ev.touches.length ? ev.touches[0] : (ev.changedTouches && ev.changedTouches.length ? ev.changedTouches[0] : ev);
+  return { x: p.clientX - rect.left, y: p.clientY - rect.top };
+}
+function onDown(ev) {
+  ev.preventDefault(); audio();
+  const { x, y } = localXY(ev);
+  const btn = hitBtn(x, y);
+  if (G.screen === 'menu') {
+    if (btn === 'start') { startGame(); return; }
+    if (btn && btn.indexOf('diff_') === 0) { setDiff(btn.slice(5)); return; }
+    return;
+  }
+  if (G.screen === 'over') {
+    if (btn === 'again') { startGame(); return; }
+    if (btn === 'menu') { G.screen = 'menu'; return; }
+    return;
+  }
+  if (btn === 'quit') { quitToMenu(); return; }
+  if (btn) return;                       // 其余按钮优先，不触发瞄准
+  G.dragging = true;
+  G.aimX = x;
+}
+function onMove(ev) {
+  if (G.screen !== 'play') return;
+  ev.preventDefault();
+  const { x } = localXY(ev);
+  if (G.dragging || ev.pointerType !== 'touch') G.aimX = x;
+}
+function onUp(ev) {
+  if (G.screen === 'play' && G.dragging) dropFruit();
+  G.dragging = false;
+}
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointermove', onMove);
+window.addEventListener('pointerup', onUp);
+window.addEventListener('pointercancel', onUp);
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'm' || e.key === 'M') { G.mute = !G.mute; return; }
+  if (G.screen === 'play') {
+    if (e.key === 'Escape') { quitToMenu(); return; }
+    if (e.key === 'ArrowLeft') G.aimX -= 16 * S;
+    if (e.key === 'ArrowRight') G.aimX += 16 * S;
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); dropFruit(); }
+    return;
+  }
+  if (e.key === 'Enter' || e.key === ' ') {
+    if (G.screen === 'menu' || G.screen === 'over') startGame();
+  }
+});
+window.addEventListener('resize', resize);
+document.addEventListener('visibilitychange', () => { lastFrame = null; });
+
+// ---- 主循环（固定步长 1/120s + dt 钳制）----
+let lastFrame = null, acc = 0;
+const STEP = 1 / 120;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  if (lastFrame === null) { lastFrame = ts; return; }
+  let dt = (ts - lastFrame) / 1000; lastFrame = ts;
+  if (dt > 0.05) dt = 0.05;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  drawScene();
+}
+
+function init() {
+  resize(); loadBest(); loadDiff();
+  G.aimX = W / 2;
+}
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
