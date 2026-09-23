@@ -1,0 +1,1366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>大富翁 · MONOPOLY</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #14171a;
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 12px;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none; -webkit-user-select: none;
+  }
+  canvas {
+    max-width: 100%;
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+    aspect-ratio: 1200 / 820;          /* JS 按横/竖屏布局覆写 */
+    border-radius: 18px;
+    box-shadow: 0 22px 70px rgba(0, 0, 0, 0.6);
+    touch-action: manipulation;
+    cursor: default;
+  }
+</style>
+</head>
+<body>
+<canvas id="cv" width="1200" height="820"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   大富翁（强手棋）· 单文件 Canvas 2D 实现
+   ─ 40 格标准棋盘：22 处地产（8 色组）+ 4 铁路 + 2 公用事业 + 机会 /
+     公益金各 16 张卡 + 两种税 + 监狱 / 免费停车 / 直接入狱 / 起点；
+   ─ 2~4 个座位：1~4 名真人在同一页面轮流操作，空位一律由电脑 AI 承担，
+     也支持全电脑自战演示；
+   ─ 规则：双骰行进、对子再掷（三连对入狱）、经过起点领薪、购地缴租、
+     同组垄断无房地租翻倍、盖房升至旅馆（均匀建造）、抵押赎回、
+     保释与出狱卡、破产资产移交；
+   ─ 座位信息卡、骰子、按钮、弹窗全部画进 Canvas 场景内；手机竖屏自动
+     切换为棋盘在上、面板在下的竖版布局。
+   简化说明（相对桌游官方规则）：放弃认购时不举办公开拍卖；欠缴时系统
+   自动按「拆房→抵押」顺序变现补款，仍不足即判破产并移交。
+   ===================================================================== */
+
+// ------------------------- 基础工具 -------------------------
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const fmt = n => (n < 0 ? '-' : '') + '¥' + Math.abs(n).toLocaleString('en-US');
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// ------------------------- 音效（Web Audio 合成） -------------------------
+let AC = null, MUTE = false;
+function ac() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(freq, dur, type, vol, when = 0, slide = 0) {
+  const a = ac(); if (!a || MUTE) return;
+  const t = a.currentTime + when;
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const SFX = {
+  click: () => tone(660, 0.06, 'square', 0.05),
+  dice:  () => { tone(240, 0.05, 'square', 0.06); tone(300, 0.05, 'square', 0.05, 0.07); tone(360, 0.05, 'square', 0.05, 0.14); },
+  step:  () => tone(500, 0.035, 'triangle', 0.045),
+  coin:  () => { tone(880, 0.08, 'triangle', 0.09); tone(1320, 0.12, 'triangle', 0.09, 0.06); },
+  pay:   () => { tone(420, 0.1, 'sawtooth', 0.06); tone(300, 0.14, 'sawtooth', 0.06, 0.08); },
+  buy:   () => { tone(523, 0.07, 'triangle', 0.08); tone(659, 0.07, 'triangle', 0.08, 0.06); tone(784, 0.12, 'triangle', 0.08, 0.12); },
+  build: () => { tone(180, 0.08, 'square', 0.07); tone(220, 0.08, 'square', 0.07, 0.08); },
+  card:  () => { tone(700, 0.05, 'sine', 0.07); tone(950, 0.09, 'sine', 0.07, 0.05); },
+  jail:  () => { tone(300, 0.25, 'sawtooth', 0.07, 0, -160); },
+  bad:   () => { tone(200, 0.3, 'sawtooth', 0.08, 0, -120); },
+  win:   () => { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'triangle', 0.09, i * 0.12)); },
+};
+
+// ------------------------- 棋盘数据 -------------------------
+const GROUPS = {
+  brown: { zh: '棕色', c: '#8f5b2b' },
+  lb:    { zh: '浅蓝', c: '#8fd0f5' },
+  pk:    { zh: '粉色', c: '#e36ba6' },
+  or:    { zh: '橙色', c: '#f1923b' },
+  rd:    { zh: '红色', c: '#e0413e' },
+  yl:    { zh: '黄色', c: '#efd24e' },
+  gn:    { zh: '绿色', c: '#48b073' },
+  db:    { zh: '深蓝', c: '#3b78d3' },
+};
+const BOARD = Array.from({ length: 40 }, (_, i) => ({ i, k: 'blank', n: '', p: 0, fee: 0 }));
+function setc(i, o) { Object.assign(BOARD[i], o); }
+setc(0, { k: 'go', n: '起点' });
+setc(10, { k: 'jail', n: '监狱' });
+setc(20, { k: 'free', n: '免费停车' });
+setc(30, { k: 'gojail', n: '进监狱' });
+setc(4,  { k: 'tax', n: '所得税', fee: 200 });
+setc(38, { k: 'tax', n: '奢侈税', fee: 100 });
+[[7, '机会'], [22, '机会'], [36, '机会']].forEach(([i, n]) => setc(i, { k: 'ch', n }));
+[[2, '公益金'], [17, '公益金'], [35, '公益金']].forEach(([i, n]) => setc(i, { k: 'cc', n }));
+[[5, '华北铁路'], [15, '华东铁路'], [25, '西南铁路'], [34, '华南铁路']].forEach(([i, n]) => setc(i, { k: 'rail', n, p: 200, m: 100 }));
+[[12, '电力公司'], [28, '自来水厂']].forEach(([i, n]) => setc(i, { k: 'util', n, p: 150, m: 75 }));
+// [格号, 组, 名, 价格, [基础,1房,2房,3房,4房,旅馆], 单房造价, 抵押价]
+const STREETS = [
+  [1,  'brown', '泰山巷',   60,  [2, 10, 30, 90, 160, 250],    50,  30],
+  [3,  'brown', '嵩山路',   60,  [4, 20, 60, 180, 320, 450],   50,  30],
+  [6,  'lb',    '洞庭街',   100, [6, 30, 90, 270, 400, 550],   50,  50],
+  [8,  'lb',    '鄱阳街',   100, [6, 30, 90, 270, 400, 550],   50,  50],
+  [9,  'lb',    '太湖路',   120, [8, 40, 100, 300, 450, 600],  50,  60],
+  [11, 'pk',    '长安街',   140, [10, 50, 150, 450, 625, 750], 100, 70],
+  [13, 'pk',    '洛阳道',   140, [10, 50, 150, 450, 625, 750], 100, 70],
+  [14, 'pk',    '开封路',   160, [12, 60, 180, 500, 700, 900], 100, 80],
+  [16, 'or',    '珠江滩',   180, [14, 70, 200, 550, 750, 950], 100, 90],
+  [18, 'or',    '漓江路',   180, [14, 70, 200, 550, 750, 950], 100, 90],
+  [19, 'or',    '岭南道',   200, [16, 80, 220, 600, 800, 1000], 100, 100],
+  [21, 'rd',    '天山道',   220, [18, 90, 250, 700, 875, 1050], 150, 110],
+  [23, 'rd',    '昆仑路',   220, [18, 90, 250, 700, 875, 1050], 150, 110],
+  [24, 'rd',    '西康路',   240, [20, 100, 300, 750, 925, 1100], 150, 120],
+  [26, 'yl',    '永宁巷',   260, [22, 110, 330, 800, 975, 1150], 150, 130],
+  [27, 'yl',    '平安街',   260, [22, 110, 330, 800, 975, 1150], 150, 130],
+  [29, 'yl',    '布达拉路', 280, [24, 120, 360, 850, 1025, 1200], 150, 140],
+  [31, 'gn',    '云冈路',   300, [26, 130, 390, 900, 1100, 1275], 200, 150],
+  [32, 'gn',    '峨眉路',   300, [26, 130, 390, 900, 1100, 1275], 200, 150],
+  [33, 'gn',    '青城山路', 320, [28, 150, 450, 1000, 1200, 1400], 200, 160],
+  [37, 'db',    '紫禁城',   350, [35, 175, 500, 1100, 1300, 1500], 200, 175],
+  [39, 'db',    '御花园',   400, [50, 200, 600, 1400, 1700, 2000], 200, 200],
+];
+STREETS.forEach(([i, g, n, p, r, h, m]) => setc(i, { k: 'street', g, n, p, r, h, m }));
+const GROUP_CELLS = {};
+for (const cell of BOARD) if (cell.k === 'street') (GROUP_CELLS[cell.g] = GROUP_CELLS[cell.g] || []).push(cell.i);
+const RAIL_CELLS = BOARD.filter(c => c.k === 'rail').map(c => c.i);
+const UTIL_CELLS = BOARD.filter(c => c.k === 'util').map(c => c.i);
+const OWNABLE = [...STREETS.map(s => s[0]), ...RAIL_CELLS, ...UTIL_CELLS];
+
+const START_CASH = 1500, GO_SALARY = 200, JAIL_FEE = 50, MAX_ROUNDS = 120;
+const CAT_NAME = c => c.k === 'street' ? GROUPS[c.g].zh + '产地' : c.k === 'rail' ? '铁路' : c.k === 'util' ? '公用事业' : '';
+
+// ------------------------- 卡牌（机会 / 公益金 各 16 张） -------------------------
+const CHANCE = [
+  { t: '前进至「起点」，领取 ¥200 薪水', f: p => advance(p, (40 - p.pos) % 40, { land: false }) },
+  { t: '前进至「紫禁城」(37)', f: p => advanceTo(p, 37) },
+  { t: '前进至「布达拉路」(29)', f: p => advanceTo(p, 29) },
+  { t: '前进至最近的铁路，若有人持有须缴双倍租金', f: p => advance(p, nearest(p, i => BOARD[i].k === 'rail'), { dblRent: true }) },
+  { t: '前进至最近的铁路，若无人持有可按标价购买', f: p => advance(p, nearest(p, i => BOARD[i].k === 'rail'), { buyOpt: true }) },
+  { t: '前进至最近的公用事业，按掷骰点数 × 10 缴租', f: p => advance(p, nearest(p, i => BOARD[i].k === 'util'), { utilX10: true }) },
+  { t: '前进至「长安街」(11)', f: p => advanceTo(p, 11) },
+  { t: '盗窃案发，直接押送监狱（不经过起点）', f: p => goToJail(p) },
+  { t: '获得「出狱自由卡」一张，可保留使用', f: p => { p.cards++; } },
+  { t: '道路年久失修：每处房产修路 ¥25，每座旅馆另加 ¥100', f: p => {
+      let c = 0; for (const ci of ownedList(p)) { c += 25; if (G.houses[ci] === 5) c += 75; }
+      payTo(p, c, -1);
+    } },
+  { t: '倒车事故，后退三步', f: p => advance(p, -3) },
+  { t: '银行记账失误，收入 ¥200', f: p => { p.cash += 200; } },
+  { t: '保单到期兑付，收入 ¥100', f: p => { p.cash += 100; } },
+  { t: '支付医生诊费 ¥50', f: p => payTo(p, 50, -1) },
+  { t: '前进至「岭南道」(19)', f: p => advanceTo(p, 19) },
+  { t: '中奖车票！前进至「洞庭街」(6)，无人持有可购买', f: p => advanceTo(p, 6, true) },
+];
+const CHEST = [
+  { t: '存款利息到账，收入 ¥50', f: p => { p.cash += 50; } },
+  { t: '卷入诉讼，直接押送监狱（不经过起点）', f: p => goToJail(p) },
+  { t: '迁居回老家，前进至「起点」并领薪水', f: p => advance(p, (40 - p.pos) % 40, { land: false }) },
+  { t: '喜结良缘，每位玩家各付你 ¥50', f: p => { for (const q of activePlayers()) if (q !== p) payTo(q, 50, p.id); } },
+  { t: '账务清算误漏，收入 ¥200', f: p => { p.cash += 200; } },
+  { t: '退税补贴发放，收入 ¥20', f: p => { p.cash += 20; } },
+  { t: '登记婚礼支出 ¥50', f: p => payTo(p, 50, -1) },
+  { t: '获得「出狱自由卡」一张，可保留使用', f: p => { p.cards++; } },
+  { t: '继承一笔遗产，收入 ¥100', f: p => { p.cash += 100; } },
+  { t: '住院手术，支付医疗费 ¥100', f: p => payTo(p, 100, -1) },
+  { t: '奖学金发放，收入 ¥150', f: p => { p.cash += 150; } },
+  { t: '支付律师咨询费 ¥50', f: p => payTo(p, 50, -1) },
+  { t: '街头抽奖，奖金 ¥100', f: p => { p.cash += 100; } },
+  { t: '预缴个人所得税 ¥50', f: p => payTo(p, 50, -1) },
+  { t: '售出旧货，收入 ¥30', f: p => { p.cash += 30; } },
+  { t: '社区互助捐款，支出 ¥20', f: p => payTo(p, 20, -1) },
+];
+
+// ------------------------- 全局状态 -------------------------
+const SEAT_NAMES = ['红队', '黄队', '蓝队', '绿队'];
+const SEAT_COLORS = ['#e0413e', '#efbf3f', '#3b78d3', '#48b073'];
+const PH_INT = ['roll', 'again', 'end', 'jail'];   // 真人可整理资产的阶段
+let G = null;                 // 一局游戏的全部状态
+let SCREEN = 'menu';
+let MENU_CFG = { seats: 4, humans: [1, 0, 0, 0] };
+let SHEET = null;             // 资产面板：null | {owner: playerId}
+let CELL_VIEW = -1;           // 棋盘格详情弹窗
+let LOG_SCROLL = 0;           // 消息记录滚动偏移
+
+function newGame(cfg) {
+  TIMERS.length = 0; vnow = 0;
+  G = {
+    seats: cfg.seats,
+    players: [],
+    idx: 0, round: 1,
+    dice: [0, 0], lastSum: 0, diceRolling: false,
+    phase: 'start',
+    owner: new Array(40).fill(-1),
+    houses: new Array(40).fill(0),
+    mort: new Array(40).fill(false),
+    chDeck: shuffle([...CHANCE.keys()]),
+    ccDeck: shuffle([...CHEST.keys()]),
+    logs: [], over: false, winner: -1,
+    buyCell: -1, cardShow: null, actPending: false, actor: 0,
+  };
+  for (let i = 0; i < cfg.seats; i++) {
+    G.players.push({
+      id: i, name: SEAT_NAMES[i], color: SEAT_COLORS[i],
+      human: !!cfg.humans[i],
+      cash: START_CASH, pos: 0, disp: 0, dir: 1, stepAt: -1e9,
+      jail: 0, cards: 0, out: false, dblStreak: 0,
+    });
+  }
+  SHEET = null; CELL_VIEW = -1;
+  const hn = cfg.humans.slice(0, cfg.seats).filter(Boolean).length;
+  logMsg(`游戏开始：${cfg.seats} 个座位，真人 ${hn} 名${hn < cfg.seats ? '，其余 ' + (cfg.seats - hn) + ' 席由电脑接管' : '同屏轮流'}`, 'sys');
+  if (hn === 0) logMsg('全体为电脑玩家：这是自战演示模式', 'sys');
+  logMsg(`初始资金 ${fmt(START_CASH)} · 经过起点领 ${fmt(GO_SALARY)} · 最多 ${MAX_ROUNDS} 轮`, 'sys');
+  startTurn();
+}
+function cur() { return G.players[G.idx]; }
+function alive() { return G.players.filter(p => !p.out); }
+function activePlayers() { return G.players.filter(p => !p.out); }
+function ownedList(p) { return OWNABLE.filter(i => G.owner[i] === p.id); }
+function logMsg(t, k) {
+  G.logs.push({ t, k: k || 'sys' });
+  if (G.logs.length > 200) G.logs.shift();
+  LOG_SCROLL = 0;   // 新消息自动滚到底部
+}
+
+// ------------------------- 虚拟时钟定时器（测试可瞬发） -------------------------
+let vnow = 0, TIMERS = [];
+function schedule(ms, fn) { TIMERS.push({ t: vnow + ms, fn }); }
+function pump(dt) {
+  vnow += dt;
+  let guard = 0;
+  while (guard++ < 500) {
+    let next = null;
+    for (const x of TIMERS) if (x.t <= vnow && (!next || x.t < next.t)) next = x;
+    if (!next) break;
+    TIMERS.splice(TIMERS.indexOf(next), 1);
+    next.fn();
+  }
+}
+function pumpFast(maxSteps = 500000) {
+  let guard = 0;
+  while (TIMERS.length && guard++ < maxSteps) {
+    let ni = 0;
+    for (let i = 1; i < TIMERS.length; i++) if (TIMERS[i].t < TIMERS[ni].t) ni = i;
+    const x = TIMERS.splice(ni, 1)[0];
+    vnow = Math.max(vnow, x.t);
+    x.fn();
+  }
+}
+
+// ------------------------- 规则核心 -------------------------
+function groupFull(id, g) { return GROUP_CELLS[g].every(i => G.owner[i] === id); }
+function rentCount(id, cells) { return cells.filter(i => G.owner[i] === id && !G.mort[i]).length; }
+
+function rentOf(ci, sum, flags = {}) {
+  const c = BOARD[ci], oid = G.owner[ci];
+  if (oid < 0 || G.mort[ci]) return 0;
+  let r = 0;
+  if (c.k === 'street') {
+    const h = G.houses[ci];
+    r = h > 0 ? c.r[h] : c.r[0] * (groupFull(oid, c.g) ? 2 : 1);
+  } else if (c.k === 'rail') {
+    r = [25, 50, 100, 200][Math.max(1, rentCount(oid, RAIL_CELLS)) - 1];
+  } else if (c.k === 'util') {
+    r = sum * (rentCount(oid, UTIL_CELLS) === 2 ? 10 : 4);
+  }
+  return Math.round(r * (flags.dblRent ? 2 : 1));
+}
+function houseCount(p) { return ownedList(p).filter(i => G.houses[i] > 0).length; }
+function netWorth(p) {
+  let v = p.cash;
+  for (const ci of ownedList(p)) v += G.mort[ci] ? BOARD[ci].m : BOARD[ci].p + G.houses[ci] * BOARD[ci].h;
+  return v;
+}
+function groupCanMort(id, g) { return GROUP_CELLS[g].every(i => G.houses[i] === 0); }
+function canBuild(ci, pid) {
+  const c = BOARD[ci];
+  return c.k === 'street' && G.owner[ci] === pid && !G.mort[ci] &&
+    groupFull(pid, c.g) && G.houses[ci] < 5 &&
+    G.houses[ci] === Math.min(...GROUP_CELLS[c.g].map(i => G.houses[i]));
+}
+function canSellHouse(ci, pid) {
+  const c = BOARD[ci];
+  return c.k === 'street' && G.owner[ci] === pid && G.houses[ci] > 0 &&
+    G.houses[ci] === Math.max(...GROUP_CELLS[c.g].map(i => G.houses[i]));
+}
+function canMort(ci, pid) {
+  return G.owner[ci] === pid && !G.mort[ci] && G.houses[ci] === 0 &&
+    (BOARD[ci].k !== 'street' || groupCanMort(pid, BOARD[ci].g));
+}
+function unmortCost(ci) { return Math.ceil(BOARD[ci].m * 1.1); }
+function canUnmort(ci, pid) { return G.owner[ci] === pid && G.mort[ci]; }
+
+function actorOn() { return G.players[G.actor]; }   // 建造/抵押只对行动者开放
+function doBuild(ci) {
+  const p = actorOn();
+  if (!canBuild(ci, p.id) || p.cash < BOARD[ci].h || !PH_INT.includes(G.phase)) return false;
+  p.cash -= BOARD[ci].h; G.houses[ci]++;
+  logMsg(`${p.name} 在「${BOARD[ci].n}」${G.houses[ci] === 5 ? '建成旅馆' : '盖了第 ' + G.houses[ci] + ' 栋房子'}，缴费 ${fmt(BOARD[ci].h)}`, 'act');
+  SFX.build();
+  return true;
+}
+function sellHouse(ci) {
+  const p = actorOn();
+  if (!canSellHouse(ci, p.id) || !PH_INT.includes(G.phase)) return false;
+  p.cash += Math.floor(BOARD[ci].h / 2); G.houses[ci]--;
+  logMsg(`${p.name} 拆除「${BOARD[ci].n}」一栋房子，收回 ${fmt(Math.floor(BOARD[ci].h / 2))}`, 'act');
+  SFX.coin();
+  return true;
+}
+function mortgage(ci) {
+  const p = actorOn();
+  if (!canMort(ci, p.id) || !PH_INT.includes(G.phase)) return false;
+  G.mort[ci] = true; p.cash += BOARD[ci].m;
+  logMsg(`${p.name} 抵押「${BOARD[ci].n}」，获得 ${fmt(BOARD[ci].m)}`, 'act');
+  SFX.pay();
+  return true;
+}
+function unmortgage(ci) {
+  const p = actorOn();
+  if (!canUnmort(ci, p.id) || p.cash < unmortCost(ci) || !PH_INT.includes(G.phase)) return false;
+  p.cash -= unmortCost(ci); G.mort[ci] = false;
+  logMsg(`${p.name} 赎回「${BOARD[ci].n}」，支付 ${fmt(unmortCost(ci))}`, 'act');
+  SFX.coin();
+  return true;
+}
+
+// 欠缴时自动变现：先均匀拆房、再按抵押价从低到高抵押
+function raiseFunds(p, need) {
+  let moved = true;
+  while (p.cash < need && moved) {
+    moved = false;
+    for (const g of Object.keys(GROUP_CELLS)) {
+      const ms = GROUP_CELLS[g].filter(i => G.owner[i] === p.id);
+      if (!ms.length) continue;
+      const mx = Math.max(...ms.map(i => G.houses[i]));
+      if (mx === 0) continue;
+      const ci = ms.find(i => G.houses[i] === mx);
+      p.cash += Math.floor(BOARD[ci].h / 2); G.houses[ci]--; moved = true;
+      logMsg(`${p.name} 被迫拆除「${BOARD[ci].n}」一栋房子`, 'bad');
+      if (p.cash >= need) return true;
+    }
+  }
+  const ms = ownedList(p).filter(i => canMort(i, p.id));
+  ms.sort((a, b) => BOARD[a].m - BOARD[b].m);
+  for (const ci of ms) {
+    if (p.cash >= need) break;
+    G.mort[ci] = true; p.cash += BOARD[ci].m;
+    logMsg(`${p.name} 被迫抵押「${BOARD[ci].n}」换 ${fmt(BOARD[ci].m)}`, 'bad');
+  }
+  return p.cash >= need;
+}
+
+function payTo(p, amt, creditorId) {
+  amt = Math.round(amt);
+  if (amt <= 0 || p.out) return true;
+  if (p.cash < amt) raiseFunds(p, amt);
+  const cred = creditorId >= 0 ? G.players[creditorId] : null;
+  if (p.cash < amt) {
+    const gave = p.cash; p.cash = 0;
+    if (cred) cred.cash += gave;
+    logMsg(`${p.name} 欠 ${cred ? cred.name : '银行'} ${fmt(amt)}，无力偿付，宣告破产`, 'bad');
+    bankrupt(p, cred);
+    return false;
+  }
+  p.cash -= amt;
+  if (cred) { cred.cash += amt; SFX.coin(); } else SFX.pay();
+  return true;
+}
+function bankrupt(p, cred) {
+  p.out = true;
+  for (const ci of ownedList(p)) {
+    if (cred) G.owner[ci] = cred.id;                 // 地产随债务移交债权玩家
+    else { G.owner[ci] = -1; G.houses[ci] = 0; G.mort[ci] = false; }
+  }
+  if (cred) { cred.cards += p.cards; logMsg(`${p.name} 名下全部资产移交 ${cred.name}`, 'bad'); }
+  else logMsg(`${p.name} 名下地产收回银行，重新发售`, 'bad');
+  p.cards = 0; p.jail = 0;
+  SFX.bad();
+  checkEnd();
+}
+function checkEnd() {
+  if (G.over) return;
+  const a = alive();
+  if (a.length <= 1) { finish(a.length ? a[0].id : -1); return; }
+  if (G.round > MAX_ROUNDS) {
+    a.sort((x, y) => netWorth(y) - netWorth(x));
+    logMsg(`满 ${MAX_ROUNDS} 轮时限，按总身家判定名次`, 'sys');
+    finish(a[0].id);
+  }
+}
+function finish(wid) {
+  G.over = true; G.winner = wid; G.phase = 'over';
+  TIMERS.length = 0;
+  if (wid >= 0) {
+    const w = G.players[wid];
+    logMsg(`★ ${w.name} 获胜！最终身家 ${fmt(netWorth(w))}`, 'good');
+    SFX.win();
+    saveStat(w);
+  } else logMsg('所有玩家同时破产，本局平局', 'sys');
+}
+
+function goToJail(p) {
+  p.pos = 10; p.disp = 10; p.dir = 1; p.stepAt = vnow; p.dblStreak = 0;
+  if (p.jail > 0) return;
+  p.jail = 3;
+  logMsg(`${p.name} 被送进监狱（最多掷 3 次对子，或缴 ${fmt(JAIL_FEE)} / 用出狱卡）`, 'bad');
+  SFX.jail();
+}
+function releaseJail(p, how) { p.jail = 0; logMsg(`${p.name} ${how}，重获自由`, 'good'); }
+
+function nearest(p, pred) {
+  for (let d = 1; d <= 40; d++) if (pred((p.pos + d) % 40)) return d;
+  return 0;
+}
+function advanceTo(p, ci, buyOpt) {
+  advance(p, (ci - p.pos + 40) % 40, buyOpt ? { buyOpt: true } : {});
+}
+
+// 逐格移动（带动画节拍）；opts: land=false 只路过 / buyOpt / dblRent / utilX10 / cont 走完续接函数
+// advance 一律走异步节拍并置 actPending，供 drawCard 等调用方判断「是否已有后续链」
+function advance(p, n, opts = {}) {
+  G.actPending = true;
+  const settle = () => {
+    G.actPending = false;
+    if (G.over || p.out) return;
+    if (opts.land === false) (opts.cont || (() => maybeAfterAction(p)))();
+    else landOn(p, opts);
+  };
+  if (n === 0) { schedule(40, settle); return; }
+  const step = n > 0 ? 1 : -1;
+  let abs = Math.abs(n);
+  const one = () => {
+    if (G.over || p.out) { G.actPending = false; return; }
+    p.disp = p.pos; p.dir = step; p.stepAt = vnow;
+    p.pos = (p.pos + step + 40) % 40;
+    if (p.pos === 0 && step > 0) { p.cash += GO_SALARY; logMsg(`${p.name} 经过起点，领取薪水 ${fmt(GO_SALARY)}`, 'good'); SFX.coin(); }
+    SFX.step();
+    if (--abs <= 0) schedule(150, settle);
+    else schedule(120, one);
+  };
+  schedule(60, one);
+}
+
+// 落地结算：所有分支必须显式续接（maybeAfterAction / offerBuy / nextPlayer）
+function landOn(p, opts = {}) {
+  if (G.over) return;
+  if (p.out) { nextPlayer(); return; }
+  const ci = p.pos, c = BOARD[ci];
+
+  if (opts.utilX10) {
+    if ((c.k === 'util') && G.owner[ci] >= 0 && G.owner[ci] !== p.id && !G.mort[ci])
+      payRent(p, ci, G.lastSum * 10);
+    else if (c.k === 'util' && G.owner[ci] < 0) { offerBuy(p, ci); return; }
+    return maybeAfterAction(p);
+  }
+  if (opts.buyOpt && (c.k === 'rail' || c.k === 'util' || c.k === 'street') && G.owner[ci] < 0) {
+    offerBuy(p, ci); return;
+  }
+  if (c.k === 'street' || c.k === 'rail' || c.k === 'util') {
+    if (G.owner[ci] < 0) { offerBuy(p, ci); return; }
+    if (G.owner[ci] === p.id) { logMsg(`${p.name} 巡视自家「${c.n}」`, 'act'); return maybeAfterAction(p); }
+    if (G.mort[ci]) { logMsg(`「${c.n}」已抵押，${p.name} 免缴租金`, 'sys'); return maybeAfterAction(p); }
+    payRent(p, ci, rentOf(ci, G.lastSum, opts));
+    return maybeAfterAction(p);
+  }
+  if (c.k === 'ch' || c.k === 'cc') return drawCard(p, c.k);
+  if (c.k === 'tax') {
+    logMsg(`${p.name} 缴纳${c.n} ${fmt(c.fee)}`, 'bad');
+    payTo(p, c.fee, -1);
+    return maybeAfterAction(p);
+  }
+  if (c.k === 'gojail') { goToJail(p); return maybeAfterAction(p); }
+  if (c.k === 'jail') { logMsg(`${p.name} 只是探监，在牢房外望了一眼`, 'sys'); return maybeAfterAction(p); }
+  if (c.k === 'free') { logMsg(`${p.name} 在「免费停车」歇了个脚`, 'sys'); return maybeAfterAction(p); }
+  if (c.k === 'go') { logMsg(`${p.name} 稳稳停在起点`, 'sys'); return maybeAfterAction(p); }
+  return maybeAfterAction(p);
+}
+function payRent(p, ci, amount) {
+  const oid = G.owner[ci], c = BOARD[ci];
+  if (amount <= 0 || oid < 0 || oid === p.id) return;
+  const ok = payTo(p, amount, oid);
+  if (ok) logMsg(`${p.name} 向 ${G.players[oid].name} 支付「${c.n}」租金 ${fmt(amount)}`, 'pay');
+}
+function drawCard(p, kind) {
+  const q = kind === 'ch' ? G.chDeck : G.ccDeck;
+  const idx = q.shift(); q.push(idx);
+  const card = (kind === 'ch' ? CHANCE : CHEST)[idx];
+  logMsg(`${p.name} 抽到${kind === 'ch' ? '「机会」' : '「公益金」'}：${card.t}`, 'card');
+  SFX.card();
+  G.cardShow = { t: card.t, kind, until: vnow + (p.human ? 1500 : 950) };
+  schedule(0, () => {
+    if (G.over || p.out) return;
+    G.cardShow = null;
+    card.f(p);
+    if (!G.actPending && !G.over && !p.out) maybeAfterAction(p);
+  });
+}
+
+// ------------------------- 回合流转 -------------------------
+const AI_DELAY = 620;
+function setPhase(ph) {
+  if (G.over) return;
+  G.phase = ph;
+  const p = cur();
+  if (!p.human && ph !== 'over') schedule(AI_DELAY, () => aiAct(ph));
+}
+function startTurn() {
+  if (G.over) return;
+  const p = cur();
+  G.actor = G.idx;
+  if (p.out) { nextPlayer(); return; }
+  logMsg(`── 第 ${G.round} 轮 · ${p.name} 的回合 ──`, 'turn');
+  setPhase(p.jail > 0 ? 'jail' : 'roll');
+}
+function nextPlayer() {
+  if (G.over) return;
+  do {
+    G.idx++;
+    if (G.idx >= G.seats) { G.idx = 0; G.round++; }
+  } while (G.players[G.idx].out);
+  G.actor = G.idx;
+  checkEnd();
+  if (!G.over) startTurn();
+}
+// 动作完成后的续接：对子重掷 or 结束回合
+function maybeAfterAction(p) {
+  if (G.over) return;
+  if (p.out || p.jail > 0) { if (!G.over) nextPlayer(); return; }
+  if (p.dblStreak > 0) setPhase('again');
+  else setPhase('end');
+}
+// 无头快进：自动处理当前真人等待点（测试/防卡死用）
+function skipPending() {
+  if (!G || G.over) return;
+  const p = cur();
+  if (G.phase === 'buy') { passBuy(p, G.buyCell); maybeAfterAction(p); }
+  else if (G.phase === 'roll' || G.phase === 'again' || G.phase === 'jail') doRoll(p);
+  else if (G.phase === 'end') nextPlayer();
+  pumpFast(50);
+}
+
+// ------------------------- 掷骰与移动 -------------------------
+function doRoll(p) {
+  if (G.over || p.out) return;
+  if (!['roll', 'again', 'jail'].includes(G.phase)) return;
+  const wasJail = p.jail > 0 && G.phase === 'jail';
+  G.phase = 'anim';
+  G.diceSpinAt = vnow;
+  SFX.dice();
+  const d1 = 1 + Math.floor(Math.random() * 6), d2 = 1 + Math.floor(Math.random() * 6);
+  G.dice = [d1, d2]; G.lastSum = d1 + d2;
+  const dbl = d1 === d2;
+  logMsg(`${p.name} 掷出 ${d1} + ${d2} = ${G.lastSum}${dbl ? '（对子！）' : ''}`, 'dice');
+  if (dbl) p.dblStreak++; else p.dblStreak = 0;
+  if (p.dblStreak >= 3) {
+    logMsg(`${p.name} 连掷三个对子，狱警亲自出马！`, 'bad');
+    schedule(350, () => { goToJail(p); nextPlayer(); });
+    return;
+  }
+  if (wasJail) {
+    p.jail--;
+    if (dbl) {
+      logMsg(`${p.name} 掷出对子，刑满释放！`, 'good');
+      schedule(400, () => { if (!G.over && !p.out) { p.disp = p.pos; p.stepAt = vnow; advance(p, G.lastSum, {}); } });
+    } else if (p.jail <= 0) {
+      schedule(350, () => {
+        if (G.over || p.out) return;
+        logMsg(`${p.name} 三振出狱无望，自动缴纳 ${fmt(JAIL_FEE)} 保释`, 'bad');
+        if (!payTo(p, JAIL_FEE, -1)) { if (!G.over) nextPlayer(); return; }
+        p.jail = 0;
+        advance(p, G.lastSum, {});
+      });
+    } else {
+      logMsg(`${p.name} 未掷出对子，仍在服刑（还可尝试 ${p.jail} 次）`, 'sys');
+      schedule(400, () => { if (!G.over) nextPlayer(); });
+    }
+    return;
+  }
+  schedule(420, () => { if (!G.over && !p.out) advance(p, G.lastSum, {}); });
+}
+
+// ------------------------- 购买 -------------------------
+function offerBuy(p, ci) {
+  const c = BOARD[ci];
+  if (p.cash < c.p) {
+    logMsg(`${p.name} 想入手「${c.n}」却现金不足（${fmt(c.p)}），只能作罢`, 'sys');
+    return maybeAfterAction(p);
+  }
+  if (!p.human) {
+    if (aiWantsBuy(p, ci)) takeBuy(p, ci); else passBuy(p, ci);
+    return maybeAfterAction(p);
+  }
+  G.buyCell = ci;
+  G.phase = 'buy';
+}
+function takeBuy(p, ci) {
+  const c = BOARD[ci];
+  p.cash -= c.p; G.owner[ci] = p.id;
+  logMsg(`${p.name} 买下「${c.n}」（${CAT_NAME(c)} ${fmt(c.p)}），地契入手`, 'good');
+  SFX.buy();
+  G.buyCell = -1;
+}
+function passBuy(p, ci) {
+  logMsg(`${p.name} 放弃认购「${BOARD[ci].n}」`, 'sys');
+  G.buyCell = -1;
+}
+
+// ------------------------- AI 决策 -------------------------
+function aiWantsBuy(p, ci) {
+  const c = BOARD[ci], price = c.p;
+  const res = 80;
+  if (p.cash - price < res) return false;
+  if (c.k === 'street') {
+    const mine = GROUP_CELLS[c.g].filter(i => G.owner[i] === p.id).length;
+    const contested = GROUP_CELLS[c.g].some(i => G.owner[i] >= 0 && G.owner[i] !== p.id);
+    if (mine + 1 >= GROUP_CELLS[c.g].length) return true;               // 凑齐整组必买
+    if (!contested) return true;                                        // 无对手竞争，低价囤组
+    return p.cash >= price + 200 && price <= 260;                       // 有竞争：中低价抢地段
+  }
+  if (c.k === 'rail') {
+    const mine = rentCount(p.id, RAIL_CELLS);
+    return p.cash >= price + (mine >= 2 ? 0 : 150);
+  }
+  return p.cash >= price + 150;
+}
+function aiBuildPlan(p) {
+  if (p.jail > 0) return;
+  for (const g of Object.keys(GROUP_CELLS)) {
+    if (!groupFull(p.id, g) || GROUP_CELLS[g].some(i => G.mort[i])) continue;
+    const ms = GROUP_CELLS[g].filter(i => G.owner[i] === p.id && canBuild(i, p.id) && G.houses[i] < 3);
+    for (const ci of ms) { if (p.cash - BOARD[ci].h >= 240) doBuild(ci); }
+  }
+}
+function aiAct(ph) {
+  if (G.over) return;
+  const p = cur();
+  if (!p || p.out || p.human) return;
+  if (ph === 'buy') { if (aiWantsBuy(p, G.buyCell)) takeBuy(p, G.buyCell); else passBuy(p, G.buyCell); return maybeAfterAction(p); }
+  if (ph === 'jail') {
+    if (p.cards > 0 && p.cash < 260) { p.cards--; releaseJail(p, '使用出狱自由卡'); }
+    else if (p.jail >= 3 || p.cash >= JAIL_FEE + 300) { /* 缴保释太亏，赌对子；最后一回合会自动缴 */ }
+    return doRoll(p);
+  }
+  if (ph === 'roll' || ph === 'again') { aiBuildPlan(p); return doRoll(p); }
+  if (ph === 'end') { return nextPlayer(); }
+}
+
+// ------------------------- 真人交互入口 -------------------------
+function humanRoll() {
+  const p = cur();
+  if (!p.human || G.over) return;
+  if (G.phase === 'jail') {
+    if (p.cards > 0) { p.cards--; releaseJail(p, '使用出狱自由卡'); }
+    else if (p.cash >= JAIL_FEE) {
+      if (!payTo(p, JAIL_FEE, -1)) { if (!G.over) nextPlayer(); return; }
+      releaseJail(p, `缴纳 ${fmt(JAIL_FEE)} 保释金`);
+    }
+    G.phase = 'roll';
+  }
+  if (G.phase === 'roll' || G.phase === 'again') doRoll(p);
+  else if (G.phase === 'end') nextPlayer();
+}
+function humanBuy(yes) {
+  const p = cur();
+  if (G.phase !== 'buy' || !p.human) return;
+  const ci = G.buyCell;
+  if (yes) takeBuy(p, ci); else passBuy(p, ci);
+  maybeAfterAction(p);
+}
+function humanEnd() {
+  const p = cur();
+  if (!p.human) return;
+  if (G.phase === 'end') nextPlayer();
+  else if (G.phase === 'again') { p.dblStreak = 0; nextPlayer(); }
+}
+function humanJailUseCard() {
+  const p = cur();
+  if (G.phase === 'jail' && p.human && p.cards > 0) {
+    p.cards--; releaseJail(p, '使用出狱自由卡');
+    G.phase = 'roll';
+  }
+}
+function canInteract() { return G && !G.over && cur().human && PH_INT.includes(G.phase); }
+
+// ------------------------- 战绩存档 -------------------------
+function loadStats() { try { return JSON.parse(localStorage.getItem('monopoly-stats-v1') || '{"games":0,"humanWin":0,"aiWin":0}'); } catch (e) { return { games: 0, humanWin: 0, aiWin: 0 }; } }
+function saveStat(w) { const s = loadStats(); s.games++; if (w && w.human) s.humanWin++; else s.aiWin++; try { localStorage.setItem('monopoly-stats-v1', JSON.stringify(s)); } catch (e) {} }
+
+// =====================================================================
+//  渲染层 · 棋盘 / 面板 / 弹窗（即时模式 UI，全部画进 Canvas）
+// =====================================================================
+const cv = $('cv'), CT = cv.getContext('2d');
+let LW = 1200, LH = 820, DPR = 1, PORTRAIT = false;
+let HOT = [];                       // 按钮热区，每帧重建
+const LY = {};
+function computeLayout() {
+  PORTRAIT = (window.innerHeight || 800) > (window.innerWidth || 1200) * 1.02;
+  if (PORTRAIT) {
+    LW = 470;
+    const s = LW - 24;
+    const py = 58 + s + 8;
+    Object.assign(LY, {
+      top: 10, topH: 40, bx: 12, by: 58, s,
+      px: 12, py, pw: s, cardW: (s - 10) / 2, cardH: 70,
+      btnY: py + 148, btnH: 104, logY: py + 148 + 110, logH: 210,
+    });
+    LH = LY.logY + LY.logH + 12;
+  } else {
+    LW = 1200; LH = 820;
+    Object.assign(LY, {
+      top: 12, topH: 40, bx: 24, by: 70, s: 656,
+      px: 700, py: 70, pw: 478, cardW: 234, cardH: 98,
+      btnY: 70 + 204, btnH: 190, logY: 70 + 204 + 198, logH: 820 - (70 + 204 + 198) - 14,
+    });
+  }
+  DPR = window.devicePixelRatio || 1;
+  cv.width = Math.round(LW * DPR); cv.height = Math.round(LH * DPR);
+  cv.style.aspectRatio = LW + ' / ' + LH;
+  CT.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CT.textBaseline = 'middle';
+}
+
+// ---------------- 绘图小工具 ----------------
+const F = (size, weight) => (weight ? weight + ' ' : '') + size + 'px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif';
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  CT.beginPath();
+  CT.moveTo(x + r, y);
+  CT.arcTo(x + w, y, x + w, y + h, r);
+  CT.arcTo(x + w, y + h, x, y + h, r);
+  CT.arcTo(x, y + h, x, y, r);
+  CT.arcTo(x, y, x + w, y, r);
+  CT.closePath();
+}
+function fillRR(x, y, w, h, r, fill, stroke) {
+  rr(x, y, w, h, r);
+  if (fill) { CT.fillStyle = fill; CT.fill(); }
+  if (stroke) { CT.strokeStyle = stroke; CT.lineWidth = 1; CT.stroke(); }
+}
+function txt(s, x, y, size, color, align, weight) {
+  CT.font = F(size, weight);
+  CT.fillStyle = color;
+  CT.textAlign = align || 'center';
+  CT.fillText(s, x, y);
+}
+function txtFit(s, x, y, size, color, align, maxw, weight) {
+  CT.font = F(size, weight);
+  const w = CT.measureText(s).width;
+  const sz = w > maxw ? Math.max(7, size * maxw / w) : size;
+  CT.font = F(sz, weight);
+  CT.fillStyle = color; CT.textAlign = align || 'center';
+  CT.fillText(s, x, y);
+}
+function btn(x, y, w, h, label, cb, opts = {}) {
+  const dis = !!opts.disabled || !cb;
+  CT.globalAlpha = dis ? 0.38 : 1;
+  const bg = opts.main ? '#c93a35' : (opts.bg || 'rgba(255,255,255,0.10)');
+  fillRR(x, y, w, h, h / 2, bg, dis ? null : 'rgba(255,255,255,0.22)');
+  txt(label, x + w / 2, y + h / 2 + 1, opts.size || Math.min(15, h * 0.42), dis ? '#9aa0b5' : (opts.fg || '#fff'), 'center', '600');
+  CT.globalAlpha = 1;
+  if (cb && !dis) HOT.push({ x, y, w, h, cb });
+}
+function dim(alpha) { CT.fillStyle = `rgba(10,12,16,${alpha})`; CT.fillRect(0, 0, LW, LH); }
+function PIPS(n) {
+  return { 1: [[1, 1]], 2: [[0, 0], [2, 2]], 3: [[0, 0], [1, 1], [2, 2]], 4: [[0, 0], [2, 0], [0, 2], [2, 2]],
+    5: [[0, 0], [2, 0], [1, 1], [0, 2], [2, 2]], 6: [[0, 0], [2, 0], [0, 1], [2, 1], [0, 2], [2, 2]] }[n] || [];
+}
+function die(x, y, s, v) {
+  fillRR(x, y, s, s, s * 0.22, '#fdf8ec', 'rgba(0,0,0,0.35)');
+  CT.fillStyle = '#2d3142';
+  for (const [cx, cy] of PIPS(v)) {
+    CT.beginPath();
+    CT.arc(x + s * (0.24 + cx * 0.26), y + s * (0.24 + cy * 0.26), s * 0.085, 0, 7);
+    CT.fill();
+  }
+}
+
+// ---------------- 棋盘几何 ----------------
+function cr(i) {
+  const { bx: x0, by: y0, s } = LY, u = s / 13, C = 2 * u, a = 0.9 * u, d = 1.72 * u;
+  if (i === 0) return { x: x0 + s - C, y: y0 + s - C, w: C, h: C, side: 'c' };
+  if (i < 10) return { x: x0 + s - C - (i - 1) * a - a, y: y0 + s - d, w: a, h: d, side: 'bottom' };
+  if (i === 10) return { x: x0, y: y0 + s - C, w: C, h: C, side: 'c' };
+  if (i < 20) { const k = i - 10; return { x: x0, y: y0 + s - C - (k - 1) * a - a, w: d, h: a, side: 'left' }; }
+  if (i === 20) return { x: x0, y: y0, w: C, h: C, side: 'c' };
+  if (i < 30) { const k = i - 20; return { x: x0 + C + (k - 1) * a, y: y0, w: a, h: d, side: 'top' }; }
+  if (i === 30) return { x: x0 + s - C, y: y0, w: C, h: C, side: 'c' };
+  { const k = i - 30; return { x: x0 + s - d, y: y0 + C + (k - 1) * a, w: d, h: a, side: 'right' }; }
+}
+function cellCenter(i) { const r = cr(i); return { x: r.x + r.w / 2, y: r.y + r.h / 2 }; }
+function barRect(i) {
+  const r = cr(i), t = r.w * (r.side === 'left' || r.side === 'right' ? 0.28 : 0.28);
+  switch (r.side) {
+    case 'bottom': return { x: r.x, y: r.y, w: r.w, h: t, vert: false };
+    case 'top': return { x: r.x, y: r.y + r.h - t, w: r.w, h: t, vert: false };
+    case 'left': return { x: r.x + r.w - t, y: r.y, w: t, h: r.h, vert: true };
+    default: return { x: r.x, y: r.y, w: t, h: r.h, vert: true };
+  }
+}
+function innerEdgePoint(i) {      // 内边标记（地主色条位置）
+  const r = cr(i);
+  switch (r.side) {
+    case 'bottom': return { x: r.x, y: r.y + r.h - 4, w: r.w, h: 4, horiz: true };
+    case 'top': return { x: r.x, y: r.y, w: r.w, h: 4, horiz: true };
+    case 'left': return { x: r.x, y: r.y, w: 4, h: r.h, horiz: false };
+    default: return { x: r.x + r.w - 4, y: r.y, w: 4, h: r.h, horiz: false };
+  }
+}
+
+function drawBoard() {
+  const { bx: x0, by: y0, s } = LY, u = s / 13;
+  CT.save(); CT.shadowColor = 'rgba(0,0,0,0.5)'; CT.shadowBlur = 24;
+  fillRR(x0 - 6, y0 - 6, s + 12, s + 12, 12, '#26332a');
+  CT.restore();
+  CT.fillStyle = '#f6eed9';
+  CT.fillRect(x0, y0, s, s);
+  for (let i = 0; i < 40; i++) drawCell(i, u);
+  CT.strokeStyle = 'rgba(45,49,66,0.35)'; CT.lineWidth = 1.4; CT.strokeRect(x0 + 0.5, y0 + 0.5, s - 1, s - 1);
+  drawCenter(u);
+  drawTokens(u);
+}
+function drawCell(i, u) {
+  const r = cr(i), c = BOARD[i];
+  CT.fillStyle = '#f8f2df'; CT.fillRect(r.x, r.y, r.w, r.h);
+  CT.strokeStyle = 'rgba(45,49,66,0.28)'; CT.lineWidth = 1; CT.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+  const oid = G.owner[i], vert = r.side === 'left' || r.side === 'right';
+  const fs = Math.max(8, u * 0.2);
+  if (c.k === 'street' || c.k === 'rail' || c.k === 'util') {
+    if (c.k === 'street') {
+      const b = barRect(i);
+      CT.fillStyle = GROUPS[c.g].c; CT.fillRect(b.x, b.y, b.w, b.h);
+      // 房子 / 旅馆
+      const hs = G.houses[i];
+      if (hs > 0 && hs < 5) {
+        const q = u * 0.17;
+        for (let k = 0; k < hs; k++) {
+          const cx = b.vert ? b.x + b.w / 2 - q / 2 : b.x + (k + 0.5) * b.w / 4 - q / 2;
+          const cy = b.vert ? b.y + (k + 0.5) * b.h / 4 - q / 2 : b.y + b.h / 2 - q / 2;
+          CT.fillStyle = '#2f9e44'; CT.fillRect(cx, cy, q, q);
+          CT.strokeStyle = 'rgba(0,0,0,0.4)'; CT.strokeRect(cx + 0.5, cy + 0.5, q - 1, q - 1);
+        }
+      } else if (hs === 5) {
+        const qw = b.vert ? b.w * 0.7 : b.w * 0.62, qh = b.vert ? b.h * 0.62 : b.h * 0.7;
+        const qx = b.x + (b.w - qw) / 2, qy = b.y + (b.h - qh) / 2;
+        CT.fillStyle = '#c92a2a'; CT.fillRect(qx, qy, qw, qh);
+        CT.strokeStyle = 'rgba(0,0,0,0.4)'; CT.strokeRect(qx + 0.5, qy + 0.5, qw - 1, qh - 1);
+      }
+    } else {
+      const b = barRect(i);
+      CT.fillStyle = c.k === 'rail' ? '#343a40' : '#495057';
+      CT.fillRect(b.x, b.y, b.w, b.h);
+    }
+    const label = c.n;
+    if (vert) {
+      const cxm = r.x + r.w / 2;
+      if (oid < 0) {
+        txtFit(label, cxm, r.y + r.h / 2 - u * 0.12, fs, '#2d3142', 'center', r.w * 0.88, '600');
+        txtFit(fmt(c.p), cxm, r.y + r.h / 2 + u * 0.17, fs * 0.78, '#8b6d3f', 'center', r.w * 0.88);
+      } else txtFit(label, cxm, r.y + r.h / 2, fs, '#2d3142', 'center', r.w * 0.88, '600');
+    } else {
+      const bot = r.side === 'bottom';
+      txtFit(label, r.x + r.w / 2, r.y + r.h * (bot ? 0.52 : 0.6), fs, '#2d3142', 'center', r.w - 6, '600');
+      if (oid < 0) txtFit(fmt(c.p), r.x + r.w / 2, r.y + r.h * (bot ? 0.8 : 0.28), fs * 0.78, '#8b6d3f', 'center', r.w - 8);
+    }
+    if (oid >= 0) {
+      const e = innerEdgePoint(i);
+      CT.fillStyle = G.players[oid].color; CT.fillRect(e.x, e.y, e.w, e.h);
+    }
+    if (G.mort[i]) {
+      fillRR(r.x + r.w / 2 - u * 0.24, r.y + r.h / 2 - u * 0.24, u * 0.48, u * 0.48, 4, 'rgba(60,60,70,0.85)');
+      txt('抵', r.x + r.w / 2, r.y + r.h / 2, u * 0.3, '#ffd27f', 'center', '700');
+    }
+  } else if (c.k === 'go') {
+    txt('起点', r.x + r.w / 2, r.y + r.h * 0.32, u * 0.3, '#2d3142', 'center', '800');
+    txt('GO →', r.x + r.w / 2, r.y + r.h * 0.52, u * 0.26, '#c93a35', 'center', '800');
+    txt(`经过领 ${fmt(GO_SALARY)}`, r.x + r.w / 2, r.y + r.h * 0.76, u * 0.18, '#5a6076');
+  } else if (c.k === 'jail') {
+    const jailed = G.players.some(q => q.jail > 0 && q.pos === 10);
+    fillRR(r.x + r.w * 0.6, r.y + r.h * 0.12, r.w * 0.3, r.h * 0.3, 4, jailed ? '#868e96' : '#ced4da', '#495057');
+    for (let k = 1; k <= 3; k++) {
+      CT.strokeStyle = '#495057'; CT.lineWidth = 1.6;
+      CT.beginPath(); CT.moveTo(r.x + r.w * 0.6 + k * r.w * 0.075, r.y + r.h * 0.12); CT.lineTo(r.x + r.w * 0.6 + k * r.w * 0.075, r.y + r.h * 0.42); CT.stroke();
+    }
+    txt('监狱', r.x + r.w * 0.36, r.y + r.h * 0.62, u * 0.24, '#2d3142', 'center', '700');
+    txt('探监', r.x + r.w * 0.36, r.y + r.h * 0.84, u * 0.18, '#8b90a3');
+  } else if (c.k === 'free') {
+    txt('P', r.x + r.w / 2, r.y + r.h * 0.34, u * 0.42, '#2f6fd0', 'center', '800');
+    txt('免费停车', r.x + r.w / 2, r.y + r.h * 0.68, u * 0.2, '#2d3142', 'center', '700');
+  } else if (c.k === 'gojail') {
+    txt('进监狱', r.x + r.w / 2, r.y + r.h * 0.36, u * 0.26, '#2d3142', 'center', '800');
+    txt('↙', r.x + r.w / 2, r.y + r.h * 0.66, u * 0.4, '#c93a35', 'center', '800');
+  } else if (c.k === 'ch' || c.k === 'cc') {
+    const rad = u * 0.16, col = c.k === 'ch' ? '#f76707' : '#0ca678';
+    const ic = c.k === 'ch' ? '?' : '¥';
+    if (vert) {
+      const fsz = u * 0.2, tw = CT.measureText ? c.n.length * fsz : 0, gap0 = u * 0.12;
+      const x0 = r.x + (r.w - (rad * 2 + gap0 + tw)) / 2, cyc = r.y + r.h / 2;
+      CT.beginPath(); CT.arc(x0 + rad, cyc, rad, 0, 7); CT.fillStyle = col; CT.fill();
+      txt(ic, x0 + rad, cyc, rad * 1.3, '#fff', 'center', '800');
+      txt(c.n, x0 + rad * 2 + gap0 + tw / 2, cyc, fsz, '#2d3142', 'center', '700');
+    } else {
+      const cx0 = r.x + r.w / 2;
+      CT.beginPath(); CT.arc(cx0, r.y + r.h * 0.32, rad, 0, 7); CT.fillStyle = col; CT.fill();
+      txt(ic, cx0, r.y + r.h * 0.32, rad * 1.3, '#fff', 'center', '800');
+      txt(c.n, cx0, r.y + r.h * 0.66, u * 0.2, '#2d3142', 'center', '700');
+    }
+  } else if (c.k === 'tax') {
+    txt(c.n, r.x + r.w / 2, r.y + r.h * 0.38, u * 0.22, '#2d3142', 'center', '700');
+    txt(c.n === '所得税' ? '💼' : '💎', r.x + r.w / 2, r.y + r.h * 0.66, u * 0.3, '#2d3142');
+  }
+}
+function drawCenter(u) {
+  const { bx: x0, by: y0, s } = LY;
+  const cx = x0 + s / 2, cy = y0 + s / 2;
+  CT.save();
+  CT.translate(cx, cy); CT.rotate(-0.06);
+  txt('大 富 翁', 0, -s * 0.30, u * 0.62, 'rgba(45,49,66,0.20)', 'center', '900');
+  CT.restore();
+  txt('强手棋 · 同屏对决', cx, cy + s * 0.30, u * 0.2, 'rgba(45,49,66,0.28)', 'center', '700');
+  // 中央骰子盘
+  const w = u * 4.6, h = u * 2.5, x = cx - w / 2, y = cy - h / 2 - u * 0.2;
+  fillRR(x, y, w, h, u * 0.3, '#2c3a2e', 'rgba(255,255,255,0.14)');
+  const p = cur();
+  const tw = u * 2.6;
+  fillRR(cx - tw / 2, y + h * 0.12, tw, u * 0.62, u * 0.31, p.color);
+  txt(G.over ? '对局结束' : p.name + (p.human ? ' · 你' : ' · 电脑'), cx, y + h * 0.12 + u * 0.31, u * 0.26, '#fff', 'center', '800');
+  const spinning = G.phase === 'anim' && vnow - G.diceSpinAt < 420;
+  const ds = u * 0.92, gap = u * 0.28;
+  const d1v = spinning ? 1 + (Math.floor(vnow / 70) % 6) : (G.dice[0] || 3);
+  const d2v = spinning ? 1 + (Math.floor((vnow + 180) / 80) % 6) : (G.dice[1] || 4);
+  die(cx - ds - gap / 2, y + h * 0.5, ds, d1v);
+  die(cx + gap / 2, y + h * 0.5, ds, d2v);
+  const ph = { anim: '移动中…', roll: p.human ? '点击掷骰子' : '电脑思考中…', again: p.human ? '对子！可再掷' : '', end: p.human ? '可整理资产后结束' : '', jail: p.human ? '监狱中：请处理' : '', buy: '', over: '', start: '', rollx: '' }[G.phase] || '';
+  txt(ph, cx, y + h + u * 0.34, u * 0.22, '#5a6076', 'center', '600');
+  if (G.lastSum && G.phase !== 'over') txt('上次 ' + G.dice[0] + '+' + G.dice[1] + '=' + G.lastSum, x + w, y + h + u * 0.34, u * 0.18, 'rgba(45,49,66,0.5)', 'right');
+}
+function tokenXY(p, idx, u) {
+  const from = cellCenter(Math.round(p.disp)), to = cellCenter(p.pos);
+  let { x, y } = to;
+  const f = clamp((vnow - p.stepAt) / 110, 0, 1);
+  if (p.disp !== p.pos) {
+    const dx = to.x - from.x, dy = to.y - from.y;
+    x = from.x + dx * f; y = from.y + dy * f;
+  }
+  const slot = [[-0.27, -0.27], [0.27, -0.27], [-0.27, 0.27], [0.27, 0.27]][idx % 4];
+  return { x: x + slot[0] * u, y: y + slot[1] * u };
+}
+function drawTokens(u) {
+  for (const p of G.players) {
+    if (p.out) continue;
+    const at = G.players.filter(q => !q.out && q.pos === p.pos);
+    const { x, y } = tokenXY(p, at.indexOf(p), u);
+    CT.save();
+    CT.shadowColor = 'rgba(0,0,0,0.4)'; CT.shadowBlur = 4; CT.shadowOffsetY = 2;
+    CT.beginPath(); CT.arc(x, y, u * 0.19, 0, 7);
+    CT.fillStyle = p.color; CT.fill();
+    CT.restore();
+    CT.lineWidth = 1.6; CT.strokeStyle = '#fff'; CT.stroke();
+    txt(p.name[0], x, y + 0.5, u * 0.17, '#fff', 'center', '800');
+  }
+}
+
+// ---------------- 玩家信息卡 ----------------
+function playerStatus(p) {
+  if (p.out) return '已破产';
+  const n = ownedList(p).length, hs = G.houses.reduce((s2, v, i) => s2 + (G.owner[i] === p.id ? v : 0), 0);
+  let s = `地产${n} 房${hs}`;
+  if (p.cards > 0) s += ` 出狱卡${p.cards}`;
+  if (p.jail > 0) s += ` · 狱中(剩${p.jail})`;
+  return s;
+}
+function drawPlayerCard(p, x, y, w, h) {
+  const isCur = !G.over && G.players[G.idx] === p;
+  fillRR(x, y, w, h, 10, p.out ? '#1d2129' : (isCur ? '#313a52' : '#262c3d'), isCur ? p.color : 'rgba(255,255,255,0.08)');
+  CT.save(); rr(x, y, w, h, 10); CT.clip();
+  CT.fillStyle = p.out ? '#3a3f4a' : p.color; CT.fillRect(x, y, 6, h);
+  CT.restore();
+  const fsz = PORTRAIT ? 12 : 14;
+  txt(p.name, x + 14, y + h * 0.24, fsz + 2, p.out ? '#6b7280' : '#fff', 'left', '800');
+  const tag = p.human ? '你' : '电脑';
+  txt(`〔${tag}〕`, x + w - 10, y + h * 0.24, fsz - 3, p.human ? '#ffd27f' : '#8b90a3', 'right');
+  txt(p.out ? '破产出局' : fmt(p.cash), x + 14, y + h * 0.55, fsz + 3, p.out ? '#ff8d8d' : '#9be29a', 'left', '800');
+  txt(playerStatus(p), x + 14, y + h * 0.83, fsz - 3, '#aab0c5', 'left');
+  if (isCur) txt('行动中', x + w - 10, y + h * 0.55, fsz - 3, '#ffd27f', 'right', '700');
+}
+
+// ---------------- 操作按钮区 ----------------
+function rowButtons(list, x, y, w, rh) {
+  const maxPerRow = PORTRAIT ? 2 : 3;
+  let i = 0, yy = y;
+  while (i < list.length) {
+    const nrow = Math.min(maxPerRow, list.length - i);
+    for (let k = 0; k < nrow; k++) {
+      const it = list[i + k];
+      const bw = (w - (nrow - 1) * 8) / nrow;
+      if (it.text) txt(it.text, x + k * (bw + 8) + bw / 2, yy + rh / 2 - 6, 12, '#8b90a3');
+      else btn(x + k * (bw + 8), yy, bw, it.tall ? rh : rh, it.label, it.cb, it);
+    }
+    i += nrow; yy += rh + 8;
+  }
+  return yy;
+}
+function drawActionButtons() {
+  const { px, py, pw, btnY, btnH } = LY;
+  const p = cur();
+  const list = [];
+  if (!G.over) {
+    if (G.phase === 'jail' && p.human) {
+      if (p.cards > 0) list.push({ label: '用出狱卡', cb: humanJailUseCard });
+      if (p.cash >= JAIL_FEE) list.push({ label: `缴保释 ${fmt(JAIL_FEE)}`, cb: humanRoll });
+      list.push({ label: '掷骰赌对子', cb: humanRoll, main: true });
+    } else if ((G.phase === 'roll') && p.human) {
+      list.push({ label: '掷 骰 子', cb: humanRoll, main: true });
+      list.push({ label: '我的资产', cb: () => { SHEET = { owner: p.id }; } });
+    } else if (G.phase === 'again' && p.human) {
+      list.push({ label: '对子再掷', cb: humanRoll, main: true });
+      list.push({ label: '结束回合', cb: humanEnd });
+    } else if (G.phase === 'end' && p.human) {
+      list.push({ label: '结束回合', cb: humanEnd, main: true });
+      list.push({ label: '我的资产', cb: () => { SHEET = { owner: p.id }; } });
+    } else if (!p.human) {
+      list.push({ text: `${p.name} 正在行动…` });
+    }
+    if (G.phase === 'anim' || (!p.human && G.phase !== 'buy')) list.push({ label: '⏩ 快进', cb: () => { pumpFast(300); } });
+  }
+  rowButtons(list, px, btnY + 4, pw, PORTRAIT ? 36 : 40);
+}
+
+// ---------------- 消息记录 ----------------
+const LOGC = { good: '#9be29a', bad: '#ff8d8d', pay: '#ffd27f', card: '#9ecbff', dice: '#fff', act: '#c8b6ff', sys: '#8b90a3', turn: '#ffd27f', '': '#8b90a3' };
+function drawLogBox() {
+  const { px, py: _py, pw, logY, logH } = LY;
+  fillRR(px, logY, pw, logH, 12, '#1c2130', 'rgba(255,255,255,0.07)');
+  txt('消息记录', px + 12, logY + 14, 12, '#8b90a3', 'left', '700');
+  const lh = PORTRAIT ? 17 : 18.5;
+  const visN = Math.max(3, Math.floor((logH - 34) / lh));
+  const total = G.logs.length;
+  LOG_SCROLL = clamp(LOG_SCROLL, 0, Math.max(0, total - visN));
+  const start = Math.max(0, total - visN - Math.round(LOG_SCROLL));
+  for (let k = 0; k < visN; k++) {
+    const e = G.logs[start + k];
+    if (!e) break;
+    const y = logY + 28 + k * lh + lh / 2;
+    const alpha = 0.45 + 0.55 * (k / visN);
+    CT.globalAlpha = alpha;
+    txtFit(e.t, px + 12, y, PORTRAIT ? 10.5 : 11.5, LOGC[e.k] || '#8b90a3', 'left', pw - 24, e.k === 'turn' ? '700' : '');
+    CT.globalAlpha = 1;
+  }
+}
+
+// ---------------- 弹窗：地产卡 ----------------
+function cellCardLines(ci) {
+  const c = BOARD[ci];
+  const lines = [];
+  if (c.k === 'street') {
+    lines.push(`租金：${c.r.slice(0, 5).map((v, k) => k === 0 ? `基础 ${fmt(v)}` : ['一', '二', '三', '四'][k - 1] + '房 ' + fmt(v)).join(' · ')}`);
+    lines.push(`旅馆 ${fmt(c.r[5])} · 每栋房造价 ${fmt(c.h)} · 抵押价 ${fmt(c.m)}`);
+    lines.push('凑齐同组地产：空地租金翻倍，且可盖房');
+  } else if (c.k === 'rail') {
+    lines.push('持有人铁路数：1条¥25 · 2条¥50 · 3条¥100 · 4条¥200');
+    lines.push(`抵押价 ${fmt(c.m)} · 不能盖房`);
+  } else if (c.k === 'util') {
+    lines.push('租金 = 对方掷骰点数 × 4；持有两家公用事业 × 10');
+    lines.push(`抵押价 ${fmt(c.m)}`);
+  }
+  return lines;
+}
+function buyCardDraw(x, y, w, ci) {
+  const c = BOARD[ci];
+  fillRR(x, y, w, 190, 14, '#f6eed9');
+  const barc = c.k === 'street' ? GROUPS[c.g].c : c.k === 'rail' ? '#343a40' : '#495057';
+  rr(x, y, w, 46, 14); CT.save(); CT.clip();
+  CT.fillStyle = barc; CT.fillRect(x, y, w, 60);
+  CT.restore();
+  txt(c.n, x + w / 2, y + 18, 20, '#fff', 'center', '800');
+  txt(CAT_NAME(c) + ' · ' + fmt(c.p), x + w / 2, y + 36, 12.5, 'rgba(255,255,255,0.9)');
+  let yy = y + 66;
+  for (const l of cellCardLines(ci)) { txtFit(l, x + 14, yy, 11.5, '#5a6076', 'left', w - 28); yy += 20; }
+  const oid = G.owner[ci];
+  txt(oid < 0 ? '目前无地契主人' : `地契主人：${G.players[oid].name}${G.mort[ci] ? '（已抵押）' : ''}${G.houses[ci] ? ' · ' + (G.houses[ci] === 5 ? '旅馆' : G.houses[ci] + '栋房') : ''}`,
+      x + 14, yy + 2, 11.5, oid < 0 ? '#8b90a3' : '#2d3142', 'left', w - 28);
+}
+function drawBuyModal() {
+  if (G.phase !== 'buy' || G.buyCell < 0) return;
+  dim(0.55);
+  const w = Math.min(380, LW - 40), x = (LW - w) / 2, h = 268, y = (LH - h) / 2;
+  const p = cur();
+  buyCardDraw(x, y, w, G.buyCell);
+  if (p.human) {
+    btn(x + 14, y + h - 52, (w - 36) / 2, 40, `购买 ${fmt(BOARD[G.buyCell].p)}`, () => humanBuy(true), { main: true });
+    btn(x + w / 2 + 4, y + h - 52, (w - 36) / 2, 40, '放弃认购', () => humanBuy(false));
+  } else {
+    txt(`${p.name} 正在盘算是否购买…`, x + w / 2, y + h - 30, 13, '#5a6076');
+  }
+}
+
+// ---------------- 弹窗：资产管理（我的资产） ----------------
+function drawSheet() {
+  if (!SHEET || !G) return;
+  const p = G.players[SHEET.owner];
+  dim(0.5);
+  const cells = ownedList(p);
+  const perRow = 38;
+  const cols = Math.min(2, Math.max(1, Math.ceil(cells.length / 13)));
+  const w = Math.min(560, LW - 24), inner = (w - 28) / cols;
+  const rows = Math.ceil(cells.length / cols) || 1;
+  const h = Math.min(LH - 40, 92 + rows * perRow);
+  const x = (LW - w) / 2, y = (LH - h) / 2;
+  fillRR(x, y, w, h, 16, '#232838', 'rgba(255,255,255,0.15)');
+  txt(`${p.name} 的地契簿`, x + 16, y + 22, 15, '#fff', 'left', '800');
+  txt(`现金 ${fmt(p.cash)} · 总资产 ${fmt(netWorth(p))}`, x + 16, y + 42, 11.5, '#aab0c5', 'left');
+  const editable = canInteract() && G.players[G.idx] === p;
+  btn(x + w - 34, y + 12, 22, 22, '×', () => { SHEET = null; }, { size: 14 });
+  CT.strokeStyle = 'rgba(255,255,255,0.08)';
+  CT.beginPath(); CT.moveTo(x + 12, y + 56); CT.lineTo(x + w - 12, y + 56); CT.stroke();
+  if (!editable) txt('（只读：仅自己回合的等待阶段可操作）', x + w / 2, y + 68, 10.5, '#8b90a3');
+  const listTop = editable ? y + 62 : y + 80;
+  cells.forEach((ci, k) => {
+    const col = Math.floor(k / Math.ceil(cells.length / cols)), row = k % Math.ceil(cells.length / cols);
+    const rx = x + 14 + col * inner, ry = listTop + row * perRow;
+    const c = BOARD[ci];
+    CT.fillStyle = 'rgba(255,255,255,0.03)'; rr(rx, ry, inner - 6, perRow - 4, 6); CT.fill();
+    CT.fillStyle = c.k === 'street' ? GROUPS[c.g].c : (c.k === 'rail' ? '#343a40' : '#495057');
+    CT.fillRect(rx + 2, ry + 2, 6, perRow - 8);
+    txtFit(c.n + (G.mort[ci] ? '·抵' : ''), rx + 14, ry + 11, 11.5, G.mort[ci] ? '#7b8194' : '#dfe3ee', 'left', inner * 0.42, '600');
+    if (G.houses[ci]) txt(G.houses[ci] === 5 ? '♨' : '🏠' + G.houses[ci], rx + 14 + inner * 0.44, ry + 11, 10, '#9be29a', 'left');
+    if (editable) {
+      let bxx = rx + 14;
+      const mini = (label, cb, col2) => { const bw2 = 52; btn(bxx, ry + 19, bw2, 15, label, cb, { size: 10, bg: col2 || 'rgba(255,255,255,0.14)' }); bxx += bw2 + 4; };
+      if (canBuild(ci, p.id) && p.cash >= c.h) mini('建' + fmt(c.h), () => doBuild(ci), '#2f9e44');
+      if (canSellHouse(ci, p.id)) mini('售' + fmt(Math.floor(c.h / 2)), () => sellHouse(ci), '#b08900');
+      if (canMort(ci, p.id)) mini('抵押 ' + fmt(c.m), () => mortgage(ci), '#7048e8');
+      if (canUnmort(ci, p.id) && p.cash >= unmortCost(ci)) mini('赎回', () => unmortgage(ci), '#1971c2');
+    } else {
+      txt(G.mort[ci] ? '已抵押' : (G.houses[ci] === 5 ? '旅馆' : G.houses[ci] ? G.houses[ci] + '房' : '空地'), rx + inner - 14, ry + 11, 10, '#8b90a3', 'right');
+    }
+  });
+}
+
+// ---------------- 弹窗：棋盘格详情 ----------------
+function drawCellView() {
+  if (CELL_VIEW < 0 || !G) return;
+  const ci = CELL_VIEW, c = BOARD[ci];
+  const w = Math.min(380, LW - 30), h = 236, x = (LW - w) / 2, y = (LH - h) / 2;
+  dim(0.45);
+  buyCardDraw(x, y, w, ci);
+  btn(x + w - 30, y + 8, 22, 22, '×', () => { CELL_VIEW = -1; }, { size: 14 });
+  const p = cur();
+  if (G.owner[ci] === p.id && canInteract()) {
+    let bx = x + 14;
+    if (canBuild(ci, p.id) && p.cash >= c.h) { btn(bx, y + h - 46, 84, 34, '建造 ' + fmt(c.h), () => doBuild(ci), { main: true }); bx += 92; }
+    if (canSellHouse(ci, p.id)) { btn(bx, y + h - 46, 84, 34, '售房回收', () => sellHouse(ci)); bx += 92; }
+    if (canMort(ci, p.id)) { btn(bx, y + h - 46, 84, 34, '抵押', () => mortgage(ci)); bx += 92; }
+    if (canUnmort(ci, p.id) && p.cash >= unmortCost(ci)) btn(bx, y + h - 46, 84, 34, '赎回', () => unmortgage(ci));
+  }
+}
+
+// ---------------- 卡牌横幅 ----------------
+function drawCardShow() {
+  if (!G || !G.cardShow || vnow > G.cardShow.until) return;
+  const cs = G.cardShow;
+  const w = Math.min(360, LW - 40), h = 84;
+  const x = (LW - w) / 2, y = PORTRAIT ? LY.by + LY.s * 0.42 : LY.by + LY.s * 0.62;
+  fillRR(x, y, w, h, 12, cs.kind === 'ch' ? '#f76707' : '#0ca678', 'rgba(255,255,255,0.4)');
+  txt(cs.kind === 'ch' ? '机 会' : '公益金', x + w / 2, y + 20, 14, '#fff', 'center', '800');
+  txtFit(cs.t, x + w / 2, y + 48, 13, '#fff', 'center', w - 30, '600');
+  txt(cur().name + ' 的卡牌', x + w / 2, y + 68, 10.5, 'rgba(255,255,255,0.8)');
+}
+
+// ---------------- 终局 ----------------
+function drawOver() {
+  if (!G || !G.over) return;
+  dim(0.62);
+  const w = Math.min(430, LW - 30), x = (LW - w) / 2, h = PORTRAIT ? 400 : 380, y = (LH - h) / 2;
+  fillRR(x, y, w, h, 18, '#242a3b', '#ffd27f');
+  const wp = G.winner >= 0 ? G.players[G.winner] : null;
+  txt(wp ? `🏆 ${wp.name} 获胜` : '平局', x + w / 2, y + 40, 24, wp ? wp.color : '#fff', 'center', '900');
+  txt(wp && wp.human ? '真人玩家登顶商业帝国！' : wp ? '电脑 AI 摘得桂冠' : '同归于尽', x + w / 2, y + 66, 12.5, '#aab0c5');
+  const ranked = [...G.players].sort((a, b) => (a.out - b.out) || (netWorth(b) - netWorth(a)));
+  ranked.forEach((p, k) => {
+    const ry = y + 92 + k * 34;
+    CT.fillStyle = p.out ? '#1d2129' : '#2b3244'; rr(x + 18, ry, w - 36, 28, 7); CT.fill();
+    CT.fillStyle = p.color; CT.fillRect(x + 18, ry, 6, 28);
+    txt(`${k + 1}. ${p.name}${p.human ? '（你）' : ''}${p.out ? ' · 破产' : ''}`, x + 32, ry + 14, 12.5, '#dfe3ee', 'left', '600');
+    txt(fmt(netWorth(p)), x + w - 26, ry + 14, 12.5, p.out ? '#ff8d8d' : '#9be29a', 'right', '700');
+  });
+  const by = y + h - 52;
+  btn(x + 18, by, (w - 44) / 2, 40, '再来一局', () => newGame(MENU_CFG), { main: true });
+  btn(x + w / 2 + 4, by, (w - 44) / 2, 40, '回菜单', () => { SCREEN = 'menu'; TIMERS.length = 0; });
+}
+
+// ---------------- 顶栏 ----------------
+function drawTopBar() {
+  const { top, topH } = LY;
+  txt('大富翁 · MONOPOLY', 16, top + topH / 2, PORTRAIT ? 14.5 : 17, '#ffd27f', 'left', '800');
+  if (G) {
+    const info = `第 ${Math.min(G.round, MAX_ROUNDS)} / ${MAX_ROUNDS} 轮 · ${G.seats} 席`;
+    if (PORTRAIT) txt(info, 160, top + topH / 2, 11, '#aab0c5', 'left');
+    else txt(info, 220, top + topH / 2, 12.5, '#aab0c5', 'left');
+  }
+  btn(LW - 92, top + 4, 40, topH - 8, MUTE ? '🔇' : '🔊', () => { MUTE = !MUTE; }, { size: 15 });
+  btn(LW - 46, top + 4, 36, topH - 8, '菜单', () => { SCREEN = 'menu'; TIMERS.length = 0; G = null; }, { size: 12 });
+}
+
+// ---------------- 菜单屏 ----------------
+function drawMenu() {
+  const cx = LW / 2;
+  let y = PORTRAIT ? 96 : 120;
+  txt('大 富 翁', cx, y, PORTRAIT ? 44 : 56, '#ffd27f', 'center', '900'); y += PORTRAIT ? 34 : 40;
+  txt('MONOPOLY · 强手棋 · 同屏多人对战', cx, y, 14, '#8b90a3', 'center', '600'); y += PORTRAIT ? 40 : 52;
+  txt('座位数', cx - 150, y + 16, 13, '#dfe3ee', 'center', '700');
+  [2, 3, 4].forEach(n => {
+    btn(cx - 100 + (n - 2) * 56, y, 48, 32, String(n), () => { MENU_CFG.seats = n; },
+        { size: 15, bg: MENU_CFG.seats === n ? '#c93a35' : 'rgba(255,255,255,0.10)' });
+  });
+  y += 48;
+  for (let i = 0; i < MENU_CFG.seats; i++) {
+    const hw = 210, x0 = cx - hw / 2, yy = y + i * 44;
+    fillRR(x0, yy, hw, 38, 10, '#232838', 'rgba(255,255,255,0.08)');
+    CT.beginPath(); CT.arc(x0 + 22, yy + 19, 8, 0, 7); CT.fillStyle = SEAT_COLORS[i]; CT.fill();
+    txt(SEAT_NAMES[i], x0 + 44, yy + 19, 13.5, '#dfe3ee', 'left', '700');
+    const isH = !!MENU_CFG.humans[i];
+    btn(x0 + hw - 86, yy + 5, 78, 28, isH ? '真人 玩家' : '电脑 AI', () => { MENU_CFG.humans[i] = isH ? 0 : 1; },
+        { size: 12.5, bg: isH ? '#1971c2' : '#495057' });
+  }
+  const hn = MENU_CFG.humans.slice(0, MENU_CFG.seats).filter(Boolean).length;
+  y += MENU_CFG.seats * 44 + 14;
+  txt(hn === 0 ? '全电脑：自战演示模式' : hn === MENU_CFG.seats ? '全真人：同屏轮流操作' : `真人 ${hn} 名同屏轮流，其余 ${MENU_CFG.seats - hn} 席电脑代打`,
+      cx, y, 12.5, '#ffd27f', 'center', '600');
+  y += 30;
+  btn(cx - 105, y, 210, 48, '开 始 游 戏', () => { SCREEN = 'game'; newGame(MENU_CFG); }, { main: true, size: 18 });
+  y += 66;
+  const rules = [
+    '规则：双骰行进 · 对子重掷（三连对入狱） · 经过起点领 ¥200',
+    '落地无主地产可买下 · 同组建满可盖房（最多 4 房 1 旅馆）',
+    '收租 / 缴税 / 抽「机会」「公益金」卡 · 现金不足自动拆卖抵押',
+    '破产移交资产 · 只剩一家获胜 · 满 120 轮按总身家判定',
+  ];
+  rules.forEach((r, k) => txt(r, cx, y + k * 20, 11.5, '#8b90a3', 'center'));
+  y += rules.length * 20 + 16;
+  const st = loadStats();
+  txt(`历史战绩：共 ${st.games} 局 · 真人胜 ${st.humanWin} · 电脑胜 ${st.aiWin}`, cx, y, 12, '#5a6076', 'center');
+  y += 26;
+  btn(cx - 76, y, 70, 30, '音效:开', () => { MUTE = false; }, { size: 12, bg: MUTE ? 'rgba(255,255,255,0.08)' : '#2f9e44' });
+  btn(cx + 6, y, 70, 30, '音效:关', () => { MUTE = true; }, { size: 12, bg: MUTE ? '#b08900' : 'rgba(255,255,255,0.08)' });
+  y += 40;
+  btn(cx - 60, y, 120, 30, '← 返回合集', () => { location.href = '../index.html'; }, { size: 12 });
+}
+
+// ---------------- 主绘制 ----------------
+function draw() {
+  HOT = [];
+  const bg = CT.createLinearGradient(0, 0, LW, LH);
+  bg.addColorStop(0, '#1b2028'); bg.addColorStop(1, '#151a21');
+  CT.fillStyle = bg; CT.fillRect(0, 0, LW, LH);
+  if (SCREEN === 'menu' || !G) { if (SCREEN === 'game' && !G) SCREEN = 'menu'; drawMenu(); return; }
+  drawTopBar();
+  drawBoard();
+  const { px, py, cardW, cardH } = LY;
+  const gapx = px + cardW * 2 > LW - 8 ? 10 : (LY.pw - cardW * 2);
+  G.players.forEach((p, i) => {
+    const col = i % 2, row = Math.floor(i / 2);
+    drawPlayerCard(p, px + col * (cardW + gapx), py + row * (cardH + 8), cardW, cardH);
+  });
+  drawActionButtons();
+  drawLogBox();
+  drawBuyModal();
+  drawSheet();
+  drawCellView();
+  drawCardShow();
+  drawOver();
+}
+
+// =====================================================================
+//  事件 / 主循环 / 初始化
+// =====================================================================
+function evPos(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * LW / r.width, y: (e.clientY - r.top) * LH / r.height };
+}
+function hitHot(q) {
+  for (let i = HOT.length - 1; i >= 0; i--) {
+    const h = HOT[i];
+    if (q.x >= h.x && q.x <= h.x + h.w && q.y >= h.y && q.y <= h.y + h.h) return h;
+  }
+  return null;
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  ac();                                   // 首次触摸解锁音频
+  const q = evPos(e);
+  const h = hitHot(q);
+  if (h) { SFX.click(); h.cb(); return; }
+  if (SCREEN !== 'game' || !G) return;
+  if (G.phase === 'buy') return;          // 购买弹窗独占点击
+  if (SHEET) { SHEET = null; return; }
+  if (CELL_VIEW >= 0) { CELL_VIEW = -1; return; }
+  if (q.x >= LY.bx && q.x <= LY.bx + LY.s && q.y >= LY.by && q.y <= LY.by + LY.s) {
+    for (let i = 0; i < 40; i++) {
+      const r = cr(i);
+      if (q.x >= r.x && q.x <= r.x + r.w && q.y >= r.y && q.y <= r.y + r.h) {
+        if (BOARD[i].k !== 'blank') CELL_VIEW = i;
+        break;
+      }
+    }
+  }
+});
+cv.addEventListener('wheel', e => {
+  if (SCREEN === 'game' && G) { LOG_SCROLL = clamp(LOG_SCROLL + (e.deltaY > 0 ? -2 : 2), -1e4, 1e4); }
+}, { passive: true });
+window.addEventListener('keydown', e => {
+  if (SCREEN !== 'game' || !G || G.over) return;
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (cur().human && ['roll', 'again', 'jail', 'end'].includes(G.phase)) humanRoll();
+  } else if (e.key === 'Escape') { SHEET = null; CELL_VIEW = -1; }
+  else if (e.key === 'Enter' && G.phase === 'buy' && cur().human) humanBuy(true);
+  else if (e.key === 'Delete' && G.phase === 'buy' && cur().human) humanBuy(false);
+});
+window.addEventListener('mousedown', () => ac(), { once: true });
+
+let lastW = 0, lastH = 0;
+function resizeCheck() {
+  const w = window.innerWidth || 1200, h = window.innerHeight || 800;
+  if (w !== lastW || h !== lastH) { lastW = w; lastH = h; computeLayout(); }
+}
+window.addEventListener('resize', resizeCheck);
+window.addEventListener('orientationchange', () => setTimeout(resizeCheck, 120));
+
+let lastTs = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  resizeCheck();
+  const dt = lastTs ? Math.min(50, ts - lastTs) : 16;
+  lastTs = ts;
+  pump(dt);
+  draw();
+}
+function init() { computeLayout(); }
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
