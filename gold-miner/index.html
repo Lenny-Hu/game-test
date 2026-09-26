@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>黄金矿工 · Gold Miner</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #2b1a0e; touch-action: none; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+// ================= 黄金矿工 · Gold Miner（Canvas 2D 单文件，零依赖零素材） =================
+// 玩法：爪钩在地面上方左右摆动，点击/空格放出，碰到矿物即抓住往回收，
+//       越重的东西收得越慢；每关限时，时间到时钱 >= 累计目标即过关进商店，
+//       商店可买 3 种升级（绞盘/磁力爪/碎岩锤），共 5 关，通关按累计所得记最佳成绩。
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---------------- 工具 ----------------
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const fmt$ = v => '$' + Math.round(v).toLocaleString('en-US');
+
+// ---------------- 常量 ----------------
+const DT = 1 / 120;
+const MAXLV = 5;
+const TH_MAX = 1.0;           // 摆角幅度（弧度，≈57°，爪摆到两端时仍低于滑轮）
+const W_OMEGA = 1.05;         // 摆动角速度 rad/s
+const V_EXT = 820;            // 放爪速度（基准像素/s，乘以缩放 S）
+const V_EMPTY = 1500;         // 空爪回收速度
+const PULL_C = 560;           // 收爪速度系数：v = PULL_C*S*(1+0.35*lv)/weight
+const TNT_TIME_PEN = 5;       // 炸药拉回顶部的时间惩罚（秒）
+const TNT_STUN = 0.9;         // 爆炸后摆爪僵直（秒）
+const BAG_MIN = 60, BAG_MAX = 450, BAG_STEP = 10;
+
+// 矿物：value 面值 / weight 重量（影响收爪速度）/ r 设计像素半径 / d 埋藏深度带（设计 y 范围）
+const DEFS = {
+  goldBig:   { key: 'goldBig',   name: '大金块', value: 500, weight: 3.8,  r: 34, kind: 'gold', d: [250, 590] },
+  goldMid:   { key: 'goldMid',   name: '中金块', value: 250, weight: 2.35, r: 25, kind: 'gold', d: [130, 590] },
+  goldSmall: { key: 'goldSmall', name: '小金块', value: 100, weight: 1.2,  r: 16, kind: 'gold', d: [60,  590] },
+  rockBig:   { key: 'rockBig',   name: '大岩石', value: 20,  weight: 5.2,  r: 28, kind: 'rock', d: [60,  590] },
+  rockSmall: { key: 'rockSmall', name: '小石块', value: 11,  weight: 3.2,  r: 17, kind: 'rock', d: [60,  590] },
+  diamond:   { key: 'diamond',   name: '钻石',   value: 600, weight: 0.9,  r: 12, kind: 'gem',  d: [300, 590] },
+  bag:       { key: 'bag',       name: '神秘袋', value: 0,   weight: 3.0,  r: 22, kind: 'bag',  d: [200, 590] },
+  tnt:       { key: 'tnt',       name: '炸药',   value: 0,   weight: 4.0,  r: 18, kind: 'tnt',  d: [330, 590] },
+};
+
+const TARGETS = [500, 1500, 2800, 4500, 6800]; // 各关累计目标（普通难度基准）
+
+const DIFF_ORDER = ['easy', 'normal', 'hard'];
+const DIFFS = {
+  easy:   { label: '简单', tmult: 0.85, time: 75, tip: '目标 ×0.85 · 每关 75 秒' },
+  normal: { label: '普通', tmult: 1.0,  time: 60, tip: '标准目标 · 每关 60 秒' },
+  hard:   { label: '困难', tmult: 1.2,  time: 50, tip: '目标 ×1.2 · 每关只有 50 秒' },
+};
+
+const UPG_ORDER = ['speed', 'magnet', 'hammer'];
+const UPGRADES = {
+  speed:  { name: '强力绞盘', desc: '收爪速度每级 +35%', costs: [400, 700, 1100] },
+  magnet: { name: '磁力爪',   desc: '抓取半径每级 +45%', costs: [300, 550, 900] },
+  hammer: { name: '碎岩锤',   desc: '碰到岩石直接砸碎（30%/60%/100%）', costs: [500, 800, 1300] },
+};
+const HAMMER_CHANCE = [0, 0.3, 0.6, 1];
+
+// ---------------- 全局状态 ----------------
+let W = 0, H = 0, S = 1, DPR = 1;
+const G = {
+  screen: 'menu',            // menu | play | shop | pause | over | win
+  diff: 'normal',
+  level: 1,
+  money: 0,                  // 可用金币（商店会扣，目标线看它）
+  earned: 0,                 // 本局累计获得（成绩口径，不受购物影响）
+  time: 0,
+  anim: 0,
+  angle: 0, adir: 1,
+  hook: { st: 'idle', len: 0, item: null },   // st: idle | ext | ret
+  items: [], decor: [],
+  lv: { speed: 0, magnet: 0, hammer: 0 },
+  stun: 0, finishing: false, shake: 0, pausedTime: false, claw: 0,
+  runSalt: 1, rng: mulberry32(1),
+  muted: false, lastSec: -1,
+  parts: [], floats: [],
+  newBest: false,
+};
+let BEST = { easy: 0, normal: 0, hard: 0 };
+let HOT = [];                                // 本帧可点区域 {x,y,w,h,id}
+const BEST_KEY = 'goldminer.best.v1';
+const DIFF_KEY = 'goldminer.diff.v1';
+
+// ---------------- 派生量 ----------------
+const diffIdx = () => Math.max(0, DIFF_ORDER.indexOf(G.diff));
+function targetFor(lv) { return Math.round(TARGETS[lv - 1] * DIFFS[G.diff].tmult / 50) * 50; }
+function pullSpeed(weight) { return PULL_C * S * (1 + 0.35 * G.lv.speed) / weight; }
+function hookRadius() { return 8 * S * (1 + 0.45 * G.lv.magnet); }
+function hammerChance() { return HAMMER_CHANCE[G.lv.hammer]; }
+function topY() { return Math.min(170 * S, H * 0.32); }
+function pivot() { return { x: W / 2, y: topY() - 78 * S }; }
+function restLen() { return 60 * S; }                 // 待机短绳长（爪悬在滑轮下方）
+function hookLen() { return Math.max(0, G.hook.len) + restLen(); }
+function rigGeom() {
+  const p = pivot(), gy = topY(), legDx = 46 * S;
+  const mx = p.x - legDx - 58 * S;                    // 矿工身体中心 x
+  const drum = { x: mx + 30 * S, y: gy - 14 * S, r: 7 * S };  // 绞盘卷筒（架脚旁）
+  return { p, gy, legDx, mx, drum };
+}
+function tipPos() {
+  const p = pivot(), L = hookLen();
+  return { x: p.x + Math.sin(G.angle) * L, y: p.y + Math.cos(G.angle) * L };
+}
+// 地下矿脉设计空间 620x660，等比映射进实际可视区 → 任意窗口尺寸不重叠、不越界
+function mineRect() {
+  const top = topY() + 66 * S, bot = H - 18 * S;
+  const mh = Math.max(120, bot - top);
+  const u = clamp(Math.min(W / 660, mh / 700), 0.35, 1.35);
+  return { u, x0: (W - 620 * u) / 2, y0: top + (mh - 660 * u) / 2 };
+}
+function itemXY(it) {
+  const m = mineRect();
+  return { x: m.x0 + it.dx * m.u, y: m.y0 + it.dy * m.u, r: it.def.r * m.u * it.jit };
+}
+
+// ---------------- 关卡生成 ----------------
+function levelPlan(lv) {
+  return {
+    goldBig:   1 + Math.ceil(lv / 2),
+    goldMid:   3 + lv,
+    goldSmall: 3 + lv,
+    rockBig:   2 + lv,
+    rockSmall: 3 + lv,
+    diamond:   lv >= 2 ? 1 + Math.floor(lv / 2) : 1,
+    bag:       1,
+    tnt:       lv >= 2 ? lv - 1 : 0,
+  };
+}
+function placeItems(level) {
+  const rnd = mulberry32(level * 7919 + diffIdx() * 10453 + G.runSalt * 999983 + 12345);
+  G.rng = rnd;
+  G.items = [];
+  const plan = levelPlan(level);
+  for (const key of Object.keys(plan)) {
+    const def = DEFS[key];
+    for (let i = 0; i < plan[key]; i++) {
+      const jit = 0.85 + rnd() * 0.35;
+      let placed = false;
+      for (let tries = 0; tries < 260 && !placed; tries++) {
+        const dx = 45 + rnd() * 530;
+        const dy = def.d[0] + rnd() * (def.d[1] - def.d[0]);
+        let okp = true;
+        for (const o of G.items) {
+          const rr = (def.r + o.def.r) * Math.max(jit, o.jit) + 16;
+          if ((dx - o.dx) * (dx - o.dx) + (dy - o.dy) * (dy - o.dy) < rr * rr) { okp = false; break; }
+        }
+        if (okp) {
+          G.items.push({ def, k: key, dx, dy, jit, val: def.value });
+          placed = true;
+        }
+      }
+    }
+  }
+  G.decor = [];
+  for (let i = 0; i < 46; i++) {
+    G.decor.push({ dx: 12 + rnd() * 596, dy: 30 + rnd() * 600, r: 2 + rnd() * 5, t: rnd() });
+  }
+}
+function bagRoll() {
+  return BAG_MIN + Math.floor(G.rng() * ((BAG_MAX - BAG_MIN) / BAG_STEP + 1)) * BAG_STEP;
+}
+
+// ---------------- 流程 ----------------
+function startGame() {
+  G.level = 1; G.money = 0; G.earned = 0;
+  G.lv.speed = 0; G.lv.magnet = 0; G.lv.hammer = 0;
+  G.runSalt = (Math.random() * 999983) | 0 || 1;
+  G.newBest = false;
+  beginLevel(1);
+  G.screen = 'play';
+}
+function beginLevel(lv) {
+  G.level = lv;
+  G.time = DIFFS[G.diff].time;
+  G.finishing = false; G.lastSec = -1;
+  G.angle = 0; G.adir = 1; G.stun = 0;
+  G.hook = { st: 'idle', len: 0, item: null };
+  placeItems(lv);
+  G.parts = []; G.floats = [];
+}
+function fire() {
+  if (G.screen !== 'play') return;
+  if (G.hook.st === 'idle') {
+    if (G.finishing || G.stun > 0) return;
+    G.hook.st = 'ext'; G.hook.len = 0;
+    sShoot();
+  } else if (G.hook.st === 'ret' && G.hook.item) {
+    const it = G.hook.item;
+    G.hook.item = null;
+    const tp = tipPos();
+    if (it.def.kind === 'tnt') { boomFx(tp.x, tp.y); sBoom(); addFloat(tp.x, tp.y, '甩掉炸弹!', '#ffd54f'); }
+    else { burst(tp.x, tp.y, '#bfa06a', 6); addFloat(tp.x, tp.y, '脱手…', '#ef9a9a'); sRelease(); }
+  }
+}
+function grabItem(it) {
+  const tp = tipPos();
+  G.items.splice(G.items.indexOf(it), 1);
+  if (it.def.kind === 'rock') {
+    if (G.rng() < hammerChance()) {           // 碎岩锤直接砸碎，爪子继续往外放
+      burst(tp.x, tp.y, '#9e9e9e', 14);
+      addFloat(tp.x, tp.y, '砸碎!', '#e0e0e0');
+      sSmash();
+      return;
+    }
+  }
+  if (it.def.kind === 'bag') it.val = bagRoll();
+  G.hook.item = it;
+  G.claw = 0.25;                       // 抓取瞬间开始合齿
+  G.hook.st = 'ret';
+  sGrab(it.def.weight);
+}
+function deliver() {
+  const it = G.hook.item;
+  G.hook.item = null;
+  G.hook.st = 'idle';
+  if (!it) return;
+  const p = pivot();
+  if (it.def.kind === 'tnt') {
+    boomFx(p.x, p.y + 20 * S);
+    sBoom();
+    G.shake = 0.6; G.stun = TNT_STUN;
+    if (!G.finishing) G.time = Math.max(0, G.time - TNT_TIME_PEN);
+    addFloat(p.x, p.y + 46 * S, '-' + TNT_TIME_PEN + ' 秒!', '#ff8a65');
+    return;
+  }
+  G.money += it.val; G.earned += it.val;
+  sCoin(it.val);
+  addFloat(p.x, p.y + 44 * S, '+' + fmt$(it.val), it.def.kind === 'rock' ? '#bdbdbd' : '#ffd54f');
+  burst(p.x, p.y + 30 * S, '#ffe082', 8);
+}
+function resolveEnd() {
+  const target = targetFor(G.level);
+  if (G.money >= target) {
+    if (G.level >= MAXLV) doWin();
+    else { G.screen = 'shop'; sFanfare(); }
+  } else {
+    doOver();
+  }
+}
+function shopNext() { beginLevel(G.level + 1); G.screen = 'play'; sClick(); }
+function doOver() {
+  G.screen = 'over';
+  G.newBest = saveBest();
+  sFail();
+}
+function doWin() {
+  G.screen = 'win';
+  G.newBest = saveBest();
+  sFanfare();
+}
+function buyUpgrade(id) {
+  const lvNow = G.lv[id];
+  if (lvNow >= 3) return false;
+  const cost = UPGRADES[id].costs[lvNow];
+  if (G.money < cost) return false;
+  G.money -= cost;
+  G.lv[id]++;
+  sBuy();
+  return true;
+}
+
+// ---------------- 持久化 ----------------
+function loadBest() {
+  try {
+    const raw = localStorage.getItem(BEST_KEY);
+    if (raw) {
+      const o = JSON.parse(raw);
+      for (const k of DIFF_ORDER) BEST[k] = Math.max(0, Number(o && o[k]) || 0);
+    }
+  } catch (e) { /* ignore */ }
+}
+function saveBest() {
+  let isNew = false;
+  if (G.earned > (BEST[G.diff] || 0)) { BEST[G.diff] = Math.round(G.earned); isNew = true; }
+  try { localStorage.setItem(BEST_KEY, JSON.stringify(BEST)); } catch (e) { /* ignore */ }
+  return isNew;
+}
+function loadDiff() {
+  try {
+    const d = localStorage.getItem(DIFF_KEY);
+    if (d && DIFFS[d]) G.diff = d;
+  } catch (e) { /* ignore */ }
+}
+function saveDiff() { try { localStorage.setItem(DIFF_KEY, G.diff); } catch (e) { /* ignore */ } }
+function quitToMenu() {
+  if (G.screen === 'play' || G.screen === 'pause' || G.screen === 'shop') {
+    if (G.screen === 'play' || G.screen === 'pause') { G.newBest = saveBest(); }
+    else if (G.earned > (BEST[G.diff] || 0)) { saveBest(); }
+  }
+  G.screen = 'menu';
+  sClick();
+}
+
+// ---------------- 更新 ----------------
+function update(dt) {
+  G.anim += dt;
+  G.claw += ((G.hook.item ? 1 : 0) - G.claw) * Math.min(1, dt * 10);
+  G.shake = Math.max(0, G.shake - dt);
+  for (let i = G.parts.length - 1; i >= 0; i--) {
+    const p = G.parts[i];
+    p.t -= dt;
+    if (p.t <= 0) { G.parts.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += (p.g || 0) * dt;
+  }
+  for (let i = G.floats.length - 1; i >= 0; i--) {
+    const f = G.floats[i];
+    f.t -= dt; f.y -= 34 * S * dt;
+    if (f.t <= 0) G.floats.splice(i, 1);
+  }
+  if (G.screen !== 'play') return;
+
+  if (G.stun > 0) G.stun -= dt;
+
+  // 摆爪 / 放爪 / 收爪
+  if (G.hook.st === 'idle') {
+    if (G.stun <= 0) {
+      G.angle += W_OMEGA * dt * G.adir;
+      if (G.angle >= TH_MAX) { G.angle = TH_MAX; G.adir = -1; }
+      else if (G.angle <= -TH_MAX) { G.angle = -TH_MAX; G.adir = 1; }
+    }
+  } else if (G.hook.st === 'ext') {
+    G.hook.len += V_EXT * S * dt;
+    const tp = tipPos();
+    // 碰物判定：命中最近的、在爪尖抓取圈内且未被持有的物
+    let bestHit = null, bestD = 1e9;
+    for (const it of G.items) {
+      const q = itemXY(it);
+      const d = Math.hypot(tp.x - q.x, tp.y - q.y);
+      if (d < q.r + hookRadius() && d < bestD) { bestHit = it; bestD = d; }
+    }
+    if (bestHit) grabItem(bestHit);
+    else if (tp.x < -24 || tp.x > W + 24 || tp.y > H - 4 || G.hook.len > H - pivot().y + 90) {
+      G.hook.st = 'ret';
+      sEmpty();
+    }
+  } else if (G.hook.st === 'ret') {
+    const v = G.hook.item ? pullSpeed(G.hook.item.def.weight) : V_EMPTY * S;
+    G.hook.len -= v * dt;
+    if (G.hook.len <= 2) deliver();
+  }
+
+  // 计时
+  if (!G.finishing) {
+    G.time -= dt;
+    const sec = Math.ceil(G.time);
+    if (sec !== G.lastSec) { G.lastSec = sec; if (sec > 0 && sec <= 10) sTick(); }
+    if (G.time <= 0) {
+      G.time = 0;
+      G.finishing = true;
+      if (G.hook.st === 'idle') resolveEnd();
+    }
+  } else if (G.hook.st === 'idle') {
+    resolveEnd();
+  }
+}
+
+// ---------------- 特效 ----------------
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 40 + Math.random() * 160;
+    G.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40, g: 420, r: (1.5 + Math.random() * 2.5) * S, color, t: 0.5 + Math.random() * 0.4 });
+  }
+}
+function boomFx(x, y) {
+  for (let i = 0; i < 26; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 300;
+    G.parts.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, g: 260, r: (2 + Math.random() * 5) * S, color: i % 3 === 0 ? '#ffca28' : i % 3 === 1 ? '#ff7043' : '#616161', t: 0.4 + Math.random() * 0.5 });
+  }
+}
+function addFloat(x, y, txt, color) {
+  G.floats.push({ x, y, txt, color, t: 1.1 });
+}
+
+// ---------------- 音效（Web Audio 实时合成） ----------------
+let AC = null;
+function ac() {
+  if (G.muted) return null;
+  try {
+    if (!AC) {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) return null;
+      AC = new C();
+    }
+    if (AC.state === 'suspended') AC.resume();
+    return AC;
+  } catch (e) { return null; }
+}
+function tone(freq, dur, type, vol, slide, delay) {
+  const a = ac(); if (!a) return;
+  const t0 = a.currentTime + (delay || 0);
+  const o = a.createOscillator(), g = a.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(freq, t0);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), t0 + dur);
+  g.gain.setValueAtTime(vol, t0);
+  g.gain.exponentialRampToValueAtTime(0.0008, t0 + dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function noiseHit(dur, vol, freq) {
+  const a = ac(); if (!a) return;
+  const n = Math.floor(a.sampleRate * dur);
+  const buf = a.createBuffer(1, n, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = a.createBufferSource(); src.buffer = buf;
+  const f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = freq || 900;
+  const g = a.createGain(); g.gain.value = vol;
+  src.connect(f); f.connect(g); g.connect(a.destination);
+  src.start();
+}
+function sShoot()  { tone(190, 0.16, 'triangle', 0.22, 95); }
+function sEmpty()  { tone(300, 0.12, 'sine', 0.12, 520); }
+function sGrab(w)  { tone(70 + 30 * w, 0.1, 'square', 0.16, 50); }
+function sRelease(){ tone(420, 0.1, 'sawtooth', 0.12, 160); }
+function sSmash()  { noiseHit(0.22, 0.3, 700); tone(120, 0.14, 'square', 0.14, 60); }
+function sCoin(v)  {
+  const base = v >= 400 ? 2 : v >= 150 ? 3 : 2;
+  for (let i = 0; i < base + (v >= 400 ? 2 : 0); i++) tone(1046 + i * 210, 0.1, 'square', 0.1, 0, i * 0.055);
+}
+function sBoom()   { noiseHit(0.5, 0.5, 320); tone(58, 0.55, 'sine', 0.5, 26); }
+function sTick()   { tone(880, 0.05, 'square', 0.08); }
+function sClick()  { tone(660, 0.05, 'square', 0.12); }
+function sBuy()    { [523, 659, 784].forEach((f, i) => tone(f, 0.09, 'triangle', 0.14, 0, i * 0.07)); }
+function sFanfare(){ [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.16, 'triangle', 0.17, 0, i * 0.11)); }
+function sFail()   { [392, 330, 262].forEach((f, i) => tone(f, 0.26, 'sawtooth', 0.12, 0, i * 0.17)); }
+
+// ---------------- 输入 ----------------
+function pushHot(id, x, y, w, h) { HOT.push({ id, x, y, w, h }); }
+function hotAt(x, y) {
+  for (let i = HOT.length - 1; i >= 0; i--) {
+    const r = HOT[i];
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return r;
+  }
+  return null;
+}
+function doAction(id) {
+  if (id === 'start') { startGame(); sClick(); }
+  else if (id.startsWith('diff:')) { G.diff = id.slice(5); saveDiff(); sClick(); }
+  else if (id.startsWith('buy:'))  { if (!buyUpgrade(id.slice(4))) sRelease(); }
+  else if (id === 'shopnext') shopNext();
+  else if (id === 'pause')  { G.screen = 'pause'; sClick(); }
+  else if (id === 'resume') { G.screen = 'play'; sClick(); }
+  else if (id === 'menu')   quitToMenu();
+  else if (id === 'again')  { startGame(); sClick(); }
+  else if (id === 'mute')   { G.muted = !G.muted; if (!G.muted) sClick(); }
+}
+function onPress(x, y) {
+  const r = hotAt(x, y);
+  if (r) { doAction(r.id); return; }
+  if (G.screen === 'play') fire();
+}
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  onPress(e.clientX, e.clientY);
+});
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault();
+    if (G.screen === 'menu') doAction('start');
+    else if (G.screen === 'over' || G.screen === 'win') doAction('again');
+    else if (G.screen === 'shop') doAction('shopnext');
+    else if (G.screen === 'pause') doAction('resume');
+    else fire();
+  } else if (e.key === 'Escape') {
+    if (G.screen === 'play') doAction('pause');
+    else if (G.screen === 'pause') doAction('resume');
+    else if (G.screen === 'over' || G.screen === 'win') doAction('menu');
+  } else if (e.key === 'm' || e.key === 'M') doAction('mute');
+  else if (G.screen === 'menu' && ['1', '2', '3'].includes(e.key)) doAction('diff:' + DIFF_ORDER[+e.key - 1]);
+});
+document.addEventListener('visibilitychange', () => { lastFrame = null; });
+
+// ---------------- 绘制基础 ----------------
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function txt(s, x, y, size, color, align, weight) {
+  ctx.fillStyle = color;
+  ctx.font = (weight || 700) + ' ' + Math.round(size) + 'px -apple-system,"PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+function pill(id, x, y, w, h, label, sub, on, active) {
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.25)'; ctx.shadowBlur = 8 * S; ctx.shadowOffsetY = 3 * S;
+  rr(x, y, w, h, h / 2);
+  ctx.fillStyle = on === false ? 'rgba(120,120,130,0.55)' : active ? '#ff8f00' : 'rgba(255,255,255,0.93)';
+  ctx.fill();
+  ctx.restore();
+  const c1 = active ? '#3b2404' : (on === false ? '#cfd2da' : '#333a4d');
+  txt(label, x + w / 2, y + (sub ? h / 2 - 8 * S : h / 2), Math.min(15 * S, h * 0.42), c1, 'center', 800);
+  if (sub) txt(sub, x + w / 2, y + h / 2 + 11 * S, Math.min(11 * S, h * 0.3), active ? 'rgba(59,36,4,0.75)' : '#8b90a3');
+  if (id) pushHot(id, x, y, w, h);
+}
+
+// ---------------- 场景绘制 ----------------
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, topY());
+  g.addColorStop(0, '#8ec9ee'); g.addColorStop(1, '#d7eefb');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, topY() + 2);
+  // 太阳
+  ctx.fillStyle = 'rgba(255,224,102,0.9)';
+  ctx.beginPath(); ctx.arc(W - 56 * S, topY() * 0.4, 20 * S, 0, Math.PI * 2); ctx.fill();
+  // 云
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  for (let i = 0; i < 2; i++) {
+    const cx = ((G.anim * 9 + i * 331) % (W + 160)) - 80, cy = topY() * (0.3 + i * 0.22);
+    ctx.beginPath();
+    ctx.arc(cx, cy, 13 * S, 0, Math.PI * 2);
+    ctx.arc(cx + 16 * S, cy + 3 * S, 10 * S, 0, Math.PI * 2);
+    ctx.arc(cx - 16 * S, cy + 4 * S, 9 * S, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+function drawUnderground() {
+  const g = ctx.createLinearGradient(0, topY(), 0, H);
+  g.addColorStop(0, '#a06a33'); g.addColorStop(0.35, '#7c4d22'); g.addColorStop(1, '#3f2410');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, topY(), W, H - topY());
+  // 地表草线
+  ctx.fillStyle = '#5d8a3c';
+  ctx.fillRect(0, topY() - 4 * S, W, 7 * S);
+  // 岩层纹
+  ctx.strokeStyle = 'rgba(0,0,0,0.08)'; ctx.lineWidth = 2 * S;
+  const m = mineRect();
+  for (let i = 1; i <= 3; i++) {
+    ctx.beginPath();
+    const y = topY() + (H - topY()) * i / 4;
+    ctx.moveTo(0, y);
+    for (let x = 0; x <= W; x += 46 * S) ctx.lineTo(x, y + Math.sin(x * 0.013 + i * 7) * 6 * S);
+    ctx.stroke();
+  }
+  // 装饰碎石
+  for (const d of G.decor) {
+    ctx.fillStyle = d.t > 0.5 ? 'rgba(0,0,0,0.13)' : 'rgba(255,255,255,0.07)';
+    ctx.beginPath();
+    ctx.arc(m.x0 + d.dx * m.u, m.y0 + d.dy * m.u, d.r * m.u, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+// 不规则块轮廓（金块/石头共用）
+function blobPath(x, y, r, seedJit) {
+  ctx.beginPath();
+  const n = 7;
+  for (let i = 0; i <= n; i++) {
+    const a = (i % n) / n * Math.PI * 2;
+    const k = 0.82 + 0.24 * Math.abs(Math.sin((i + 1) * 2.1 + seedJit * 9));
+    const px = x + Math.cos(a) * r * k, py = y + Math.sin(a) * r * k * 0.88;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+function drawItem(it, x, y, r) {
+  const d = it.def, k = d.kind;
+  ctx.save();
+  if (k === 'gold') {
+    const g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.15, x, y, r * 1.15);
+    g.addColorStop(0, '#ffe17a'); g.addColorStop(0.55, '#f5b81e'); g.addColorStop(1, '#b47a09');
+    ctx.fillStyle = g;
+    blobPath(x, y, r, it.jit); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,72,4,0.6)'; ctx.lineWidth = Math.max(1, 1.6 * r / 24); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.beginPath(); ctx.ellipse(x - r * 0.3, y - r * 0.38, r * 0.22, r * 0.1, -0.6, 0, Math.PI * 2); ctx.fill();
+    const tw = (Math.sin(G.anim * 3 + it.dx) + 1) / 2;
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.25 + tw * 0.5) + ')';
+    ctx.beginPath(); ctx.arc(x + r * 0.4, y - r * 0.15, r * 0.06 + tw * r * 0.05, 0, Math.PI * 2); ctx.fill();
+  } else if (k === 'rock') {
+    const g = ctx.createRadialGradient(x - r * 0.3, y - r * 0.4, r * 0.15, x, y, r * 1.2);
+    g.addColorStop(0, '#b8bcc4'); g.addColorStop(0.6, '#84898f'); g.addColorStop(1, '#565a60');
+    ctx.fillStyle = g;
+    blobPath(x, y, r, it.jit + 0.5); ctx.fill();
+    ctx.strokeStyle = 'rgba(30,32,36,0.55)'; ctx.lineWidth = Math.max(1, 1.6 * r / 24); ctx.stroke();
+    ctx.strokeStyle = 'rgba(30,32,36,0.4)';
+    ctx.beginPath();
+    ctx.moveTo(x - r * 0.3, y - r * 0.15); ctx.lineTo(x + r * 0.05, y + r * 0.1); ctx.lineTo(x - r * 0.05, y + r * 0.4);
+    ctx.stroke();
+  } else if (k === 'gem') {
+    const sp = (Math.sin(G.anim * 5 + it.dy) + 1) / 2;
+    ctx.fillStyle = '#7ff0e8';
+    ctx.beginPath();
+    ctx.moveTo(x, y - r); ctx.lineTo(x + r * 0.95, y - r * 0.15); ctx.lineTo(x, y + r); ctx.lineTo(x - r * 0.95, y - r * 0.15);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#2ea8a0'; ctx.lineWidth = Math.max(1, 1.6 * r / 12); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.beginPath(); ctx.moveTo(x - r * 0.95, y - r * 0.15); ctx.lineTo(x + r * 0.95, y - r * 0.15);
+    ctx.moveTo(x, y - r); ctx.lineTo(x - r * 0.4, y - r * 0.15); ctx.moveTo(x, y - r); ctx.lineTo(x + r * 0.4, y - r * 0.15);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.3 + sp * 0.6) + ')';
+    ctx.beginPath(); ctx.arc(x + r * (0.9 + sp * 0.5), y - r * (0.9 + sp * 0.5), r * 0.14, 0, Math.PI * 2); ctx.fill();
+  } else if (k === 'bag') {
+    ctx.fillStyle = '#c9a05c';
+    ctx.beginPath(); ctx.arc(x, y + r * 0.12, r * 0.86, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#8a6428'; ctx.lineWidth = Math.max(1, 1.6 * r / 22); ctx.stroke();
+    ctx.fillStyle = '#a5803f';
+    ctx.beginPath();
+    ctx.moveTo(x - r * 0.34, y - r * 0.6); ctx.lineTo(x + r * 0.34, y - r * 0.6);
+    ctx.lineTo(x + r * 0.52, y - r * 1.02); ctx.lineTo(x - r * 0.52, y - r * 1.02);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    txt('$', x, y + r * 0.18, r * 1.05, '#fff3d6', 'center', 800);
+  } else if (k === 'tnt') {
+    const w = r * 1.7, h = r * 1.35;
+    ctx.save();
+    ctx.translate(x, y);
+    rr(-w / 2, -h / 2, w, h, r * 0.18);
+    ctx.fillStyle = '#b3402f'; ctx.fill();
+    ctx.strokeStyle = '#6d2018'; ctx.lineWidth = Math.max(1, 1.8 * r / 18); ctx.stroke();
+    txt('TNT', 0, 0, r * 0.62, '#ffe3b3', 'center', 800);
+    ctx.strokeStyle = '#7a5a34';
+    ctx.beginPath(); ctx.moveTo(0, -h / 2); ctx.quadraticCurveTo(r * 0.5, -h, r * 0.9, -h * 0.82); ctx.stroke();
+    const fl = (Math.sin(G.anim * 13) + 1) / 2;
+    ctx.fillStyle = 'rgb(255,' + Math.round(160 + fl * 90) + ',60)';
+    ctx.beginPath(); ctx.arc(r * 0.9, -h * 0.82, r * (0.12 + fl * 0.09), 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+function drawRopeAndClaw() {
+  const p = pivot(), tp = tipPos(), g = rigGeom();
+  const wr = 13.5 * S;                                // 绳贴滑轮外缘
+  const aTip = Math.atan2(tp.y - p.y, tp.x - p.x);
+  const aDrum = Math.atan2(g.drum.y - p.y, g.drum.x - p.x);
+  let arc = aDrum - aTip;
+  while (arc > Math.PI) arc -= Math.PI * 2;
+  while (arc < -Math.PI) arc += Math.PI * 2;
+  ctx.save();
+  ctx.strokeStyle = '#e8d9b0'; ctx.lineWidth = Math.max(1.5, 2.6 * S); ctx.lineCap = 'round';
+  // 绳：爪吊环 → 滑轮外缘
+  ctx.beginPath(); ctx.moveTo(tp.x, tp.y);
+  ctx.lineTo(p.x + Math.cos(aTip) * wr, p.y + Math.sin(aTip) * wr); ctx.stroke();
+  // 绳：绕过滑轮
+  ctx.beginPath(); ctx.arc(p.x, p.y, wr, aTip, aTip + arc, arc < 0); ctx.stroke();
+  // 绳：滑轮 → 绞盘卷筒
+  ctx.beginPath();
+  ctx.moveTo(p.x + Math.cos(aTip + arc) * wr, p.y + Math.sin(aTip + arc) * wr);
+  ctx.lineTo(g.drum.x - 2 * S, g.drum.y - g.drum.r * 0.5);
+  ctx.stroke();
+  // 被夹住的物品：沿爪轴悬挂、合齿时向爪心收拢，画在齿下层被包住
+  const cr = 12 * S + hookRadius() * 0.45;
+  const gp = clamp(G.claw, 0, 1);
+  if (G.hook.item) {
+    const q = G.hook.item;
+    const qr = q.def.r * mineRect().u * q.jit;
+    const dIt = cr * (1.95 - 0.75 * gp) + qr * 0.9;
+    drawItem(q, tp.x + Math.sin(G.angle) * dIt, tp.y + Math.cos(G.angle) * dIt, qr);
+  }
+  // 三齿爪钩：吊环圆心就在绳端，齿朝下（沿绳方向，与摆角镜像一致）
+  ctx.translate(tp.x, tp.y);
+  ctx.rotate(-G.angle);
+  ctx.strokeStyle = '#5b6068'; ctx.lineWidth = Math.max(1.5, 2.8 * S);
+  ctx.beginPath(); ctx.arc(0, 0, cr * 0.3, 0, Math.PI * 2); ctx.stroke();              // 吊环
+  ctx.fillStyle = '#8d939c';
+  ctx.fillRect(-cr * 0.16, cr * 0.26, cr * 0.32, cr * 0.42);                           // 颈部
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#9aa6b6'; ctx.lineWidth = Math.max(2.5, 4.4 * S);
+  for (const s of [-1, 1]) {                                                           // 侧齿：张开外扩，合拢收向爪心
+    ctx.beginPath();
+    ctx.moveTo(s * cr * 0.28, cr * 0.62);
+    ctx.quadraticCurveTo(s * cr * (1.45 - 0.9 * gp), cr * (1.25 - 0.2 * gp),
+                         s * cr * (0.85 - 0.5 * gp), cr * (2.05 - 0.55 * gp));
+    ctx.stroke();
+  }
+  ctx.beginPath();                                                                     // 中齿：合拢时上抬扣住物
+  ctx.moveTo(0, cr * 0.7);
+  ctx.quadraticCurveTo(cr * 0.16, cr * 1.5, 0, cr * (1.95 - 0.62 * gp));
+  ctx.stroke();
+  ctx.restore();
+}
+function drawRig() {
+  const p = pivot(), gy = topY(), legDx = 46 * S;
+  const wood = '#7a5230', woodDark = '#5b3a1f';
+  function beam(x0, y0, x1, y1, w0, w1, col) {           // 变粗端点的木梁
+    const dx = x1 - x0, dy = y1 - y0, L = Math.hypot(dx, dy) || 1;
+    const nx = -dy / L, ny = dx / L;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(x0 + nx * w0, y0 + ny * w0);
+    ctx.lineTo(x1 + nx * w1, y1 + ny * w1);
+    ctx.lineTo(x1 - nx * w1, y1 - ny * w1);
+    ctx.lineTo(x0 - nx * w0, y0 - ny * w0);
+    ctx.closePath(); ctx.fill();
+  }
+  // 三角支架（前腿亮、后腿暗）+ 横撑 + 脚墩
+  beam(p.x - legDx, gy, p.x, p.y + 4 * S, 5.5 * S, 3.5 * S, wood);
+  beam(p.x + legDx, gy, p.x, p.y + 4 * S, 5.5 * S, 3.5 * S, woodDark);
+  beam(p.x - legDx * 0.6, gy - 26 * S, p.x + legDx * 0.6, gy - 26 * S, 3.2 * S, 3.2 * S, woodDark);
+  ctx.fillStyle = '#4c3418';
+  ctx.fillRect(p.x - legDx - 7 * S, gy - 5 * S, 14 * S, 7 * S);
+  ctx.fillRect(p.x + legDx - 7 * S, gy - 5 * S, 14 * S, 7 * S);
+  // 天轮滑轮（收放绳时转动）
+  ctx.fillStyle = '#3f2c16';
+  ctx.beginPath(); ctx.arc(p.x, p.y, 12 * S, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#c9a05c';
+  ctx.beginPath(); ctx.arc(p.x, p.y, 9 * S, 0, Math.PI * 2); ctx.fill();
+  const rot = G.hook.len * 0.05 + (G.hook.st === 'idle' ? G.anim * 0.5 : 0);
+  ctx.strokeStyle = '#7a5230'; ctx.lineWidth = 2 * S;
+  for (let i = 0; i < 3; i++) {
+    const a = rot + i * Math.PI * 2 / 3;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + Math.cos(a) * 8 * S, p.y + Math.sin(a) * 8 * S); ctx.stroke();
+  }
+  ctx.fillStyle = '#3f2c16';
+  ctx.beginPath(); ctx.arc(p.x, p.y, 2.6 * S, 0, Math.PI * 2); ctx.fill();
+  // 顶旗
+  ctx.strokeStyle = woodDark; ctx.lineWidth = 2.4 * S;
+  ctx.beginPath(); ctx.moveTo(p.x, p.y - 10 * S); ctx.lineTo(p.x, p.y - 26 * S); ctx.stroke();
+  ctx.fillStyle = '#e2554f';
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y - 26 * S); ctx.lineTo(p.x + 15 * S, p.y - 21 * S); ctx.lineTo(p.x, p.y - 16 * S);
+  ctx.closePath(); ctx.fill();
+  // 绞盘：立柱 + 卷筒 + 摇柄（收绳时快速转动）
+  const g = rigGeom(), mx = g.mx, my = g.gy, drum = g.drum;
+  const bob = Math.sin(G.anim * 2.2) * 1.6 * S;
+  const reel = G.hook.st === 'ret';
+  const ha = reel ? G.anim * 9 : G.anim * 1.2;
+  beam(mx + 18 * S, my, drum.x, drum.y + 4 * S, 3 * S, 2.4 * S, woodDark);
+  beam(mx + 30 * S, my, drum.x + 4 * S, drum.y + 4 * S, 3 * S, 2.4 * S, woodDark);
+  ctx.fillStyle = '#3f2c16';
+  ctx.beginPath(); ctx.arc(drum.x, drum.y, drum.r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#c9a05c';
+  ctx.beginPath(); ctx.arc(drum.x, drum.y, drum.r * 0.62, 0, Math.PI * 2); ctx.fill();
+  // 矿工（站在绞盘左侧，手扶摇柄）
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#37474f'; ctx.lineWidth = 6 * S;
+  ctx.beginPath();
+  ctx.moveTo(mx - 5 * S, my - 18 * S); ctx.lineTo(mx - 6 * S, my);
+  ctx.moveTo(mx + 5 * S, my - 18 * S); ctx.lineTo(mx + 7 * S, my);
+  ctx.stroke();
+  ctx.fillStyle = '#4a6fa5';
+  rr(mx - 11 * S, my - 44 * S + bob, 22 * S, 28 * S, 7 * S); ctx.fill();
+  ctx.fillStyle = '#3c5a86';
+  rr(mx - 11 * S, my - 44 * S + bob, 22 * S, 9 * S, 5 * S); ctx.fill();
+  // 手臂：肩膀 → 摇柄握把
+  const hx = drum.x + Math.cos(ha) * 12 * S, hy = drum.y + Math.sin(ha) * 12 * S;
+  ctx.strokeStyle = '#e0ac69'; ctx.lineWidth = 5 * S;
+  ctx.beginPath(); ctx.moveTo(mx + 7 * S, my - 38 * S + bob); ctx.lineTo(hx, hy); ctx.stroke();
+  ctx.strokeStyle = '#5b3a1f'; ctx.lineWidth = 3 * S;
+  ctx.beginPath(); ctx.moveTo(drum.x, drum.y); ctx.lineTo(hx, hy); ctx.stroke();
+  ctx.fillStyle = '#ffcc80';
+  ctx.beginPath(); ctx.arc(mx, my - 52 * S + bob, 8.5 * S, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#ffb300';
+  ctx.beginPath(); ctx.arc(mx, my - 53.5 * S + bob, 9 * S, Math.PI, 0); ctx.fill();
+  ctx.fillRect(mx - 11.5 * S, my - 54.5 * S + bob, 23 * S, 3 * S);
+  ctx.fillStyle = '#fff59d';
+  ctx.beginPath(); ctx.arc(mx + 4 * S, my - 58 * S + bob, 2.4 * S, 0, Math.PI * 2); ctx.fill();
+}
+function drawFx() {
+  for (const p of G.parts) {
+    ctx.globalAlpha = clamp(p.t * 2, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const f of G.floats) {
+    ctx.globalAlpha = clamp(f.t, 0, 1);
+    txt(f.txt, f.x, f.y, 16 * S, f.color, 'center', 800);
+  }
+  ctx.globalAlpha = 1;
+}
+function drawWorld() {
+  drawSky();
+  drawUnderground();
+  for (const it of G.items) {
+    const q = itemXY(it);
+    drawItem(it, q.x, q.y, q.r);
+  }
+  drawRig();
+  drawRopeAndClaw();
+  drawFx();
+}
+
+// ---------------- HUD ----------------
+function drawHUD() {
+  const pad = 8 * S, barH = 46 * S;
+  ctx.save();
+  rr(pad, pad, W - pad * 2, barH, 14 * S);
+  ctx.fillStyle = 'rgba(30,20,10,0.62)'; ctx.fill();
+  ctx.restore();
+  const target = targetFor(G.level);
+  const okm = G.money >= target;
+  const fs = clamp(13 * S, 11, 16);
+  const y = pad + barH / 2;
+  // 左：关卡 + 钱/目标
+  txt('第 ' + G.level + '/' + MAXLV + ' 关', pad + 12 * S, y - 9 * S, fs, '#ffe17a', 'left', 800);
+  txt(fmt$(G.money) + ' / ' + fmt$(target), pad + 12 * S, y + 10 * S, fs, okm ? '#a5d6a7' : '#ffab91', 'left', 800);
+  // 中：时间条
+  const tbW = Math.min(180 * S, W * 0.3), tbX = W / 2 - tbW / 2, tbY = y - 4 * S;
+  rr(tbX, tbY, tbW, 9 * S, 5 * S);
+  ctx.fillStyle = 'rgba(255,255,255,0.16)'; ctx.fill();
+  const frac = G.finishing ? 0 : G.time / DIFFS[G.diff].time;
+  if (frac > 0) {
+    rr(tbX, tbY, Math.max(9 * S, tbW * frac), 9 * S, 5 * S);
+    ctx.fillStyle = G.time <= 10 && !G.finishing ? '#ef5350' : '#4ecdc4'; ctx.fill();
+  }
+  txt(G.finishing ? '本波收尾…' : Math.ceil(G.time) + 's', W / 2, tbY + 19 * S, fs * 0.85, '#eceff1');
+  // 右：得分
+  txt('得分 ' + fmt$(G.earned), W - pad - 12 * S, y - 9 * S, fs, '#b0bec5', 'right', 800);
+  const ups = UPG_ORDER.filter(k => G.lv[k] > 0).map(k => UPGRADES[k].name.slice(0, 2) + ' Lv' + G.lv[k]).join(' ');
+  txt(ups || '无升级', W - pad - 12 * S, y + 10 * S, fs * 0.85, '#ffcc80', 'right');
+  // 顶部小按钮
+  const bY = pad + barH + 8 * S, bH = 26 * S, bW = 44 * S;
+  pill(null, W - pad - bW, bY, bW, bH, G.muted ? '🔇' : '🔊', null, true, false);
+  HOT.push({ id: 'mute', x: W - pad - bW, y: bY, w: bW, h: bH });
+  pill(null, W - pad - bW * 2 - 6 * S, bY, bW, bH, '⏸', null, true, false);
+  HOT.push({ id: 'pause', x: W - pad - bW * 2 - 6 * S, y: bY, w: bW, h: bH });
+  // 操作提示
+  if (G.level === 1 && G.time > DIFFS[G.diff].time - 6 && !G.finishing) {
+    ctx.globalAlpha = clamp((G.time - (DIFFS[G.diff].time - 6.5)) / 1.5, 0, 1) * (0.6 + 0.4 * Math.sin(G.anim * 4));
+    txt('点击屏幕 / 空格 放爪钩，收爪途中再点可脱手', W / 2, H - 40 * S, 13 * S, '#fff8e1', 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ---------------- 面板通用 ----------------
+function dim(a) { ctx.fillStyle = 'rgba(15,8,3,' + a + ')'; ctx.fillRect(0, 0, W, H); }
+function panel(w, h) {
+  const x = (W - w) / 2, y = (H - h) / 2;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.45)'; ctx.shadowBlur = 26 * S;
+  rr(x, y, w, h, 22 * S);
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, '#fff6e6'); g.addColorStop(1, '#f4e2c4');
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = '#b08948'; ctx.lineWidth = 2.5 * S; ctx.stroke();
+  ctx.restore();
+  return { x, y, w, h };
+}
+
+// ---------------- 菜单 ----------------
+function drawMenu() {
+  drawWorld();
+  dim(0.35);
+  const w = Math.min(560 * S, W - 24), h = Math.min(480 * S, H - 24);
+  const P = panel(w, h);
+  const cx = P.x + w / 2;
+  txt('黄金矿工', cx, P.y + 48 * S, Math.min(38 * S, w * 0.11), '#8a5a1e', 'center', 800);
+  txt('GOLD MINER · Canvas 2D', cx, P.y + 78 * S, 12 * S, '#b08948');
+  txt('选难度开始（1/2/3 快捷切换）', cx, P.y + 104 * S, 12.5 * S, '#7a6a4f');
+  // 难度胶囊
+  const cw = Math.min(300 * S, w - 48 * S), ch = 44 * S, gap = 52 * S;
+  DIFF_ORDER.forEach((k, i) => {
+    const y = P.y + 120 * S + i * gap;
+    const active = G.diff === k;
+    pill('diff:' + k, cx - cw / 2, y, cw, ch,
+      DIFFS[k].label + ' · ' + DIFFS[k].tip,
+      '最佳成绩 ' + fmt$(BEST[k] || 0), active, active);
+  });
+  const by = P.y + 120 * S + 3 * gap + 10 * S;
+  pill('start', cx - 90 * S, by, 180 * S, 48 * S, '开 始 游 戏', null, true, true);
+  txt('5 关逐关达标 · 过关进商店升级 · Enter/空格开始 · M 静音', cx, P.y + h - 18 * S, 11.5 * S, '#8d7a5c');
+}
+
+// ---------------- 商店 ----------------
+function drawShop() {
+  dim(0.45);
+  const w = Math.min(520 * S, W - 20), h = Math.min(436 * S, H - 16);
+  const P = panel(w, h);
+  const cx = P.x + w / 2;
+  txt('第 ' + G.level + ' 关达成！', cx, P.y + 34 * S, 24 * S, '#2e7d32', 'center', 800);
+  const nextT = targetFor(G.level + 1);
+  txt('现有 ' + fmt$(G.money) + '　·　下一关目标 ' + fmt$(nextT), cx, P.y + 62 * S, 14 * S, G.money < nextT ? '#c62828' : '#2e7d32');
+  if (G.money < nextT) txt('钱全部花光会过不了下一关目标，留点余量！', cx, P.y + 84 * S, 11.5 * S, '#c62828');
+  const cw = w - 44 * S, chh = 86 * S, cy0 = P.y + 100 * S;
+  UPG_ORDER.forEach((k, i) => {
+    const up = UPGRADES[k], lvNow = G.lv[k];
+    const y = cy0 + i * (chh + 12 * S);
+    const maxed = lvNow >= 3;
+    const cost = maxed ? 0 : up.costs[lvNow];
+    const afford = !maxed && G.money >= cost;
+    rr(P.x + 22 * S, y, cw, chh, 14 * S);
+    ctx.fillStyle = afford ? 'rgba(255,255,255,0.85)' : 'rgba(230,225,215,0.6)';
+    ctx.fill();
+    ctx.strokeStyle = afford ? '#2e7d32' : 'rgba(120,100,60,0.4)';
+    ctx.lineWidth = 1.6 * S; ctx.stroke();
+    txt(up.name, P.x + 38 * S, y + 24 * S, 16.5 * S, '#4e342e', 'left', 800);
+    // 等级点
+    for (let p = 0; p < 3; p++) {
+      ctx.beginPath();
+      ctx.arc(P.x + 38 * S + p * 16 * S + 6 * S, y + 46 * S, 5.4 * S, 0, Math.PI * 2);
+      ctx.fillStyle = p < lvNow ? '#ff8f00' : 'rgba(0,0,0,0.12)';
+      ctx.fill();
+    }
+    txt(up.desc, P.x + 96 * S, y + 46 * S, 11.5 * S, '#7a6a4f', 'left');
+    const bw = 96 * S;
+    pill(afford ? 'buy:' + k : null, P.x + 22 * S + cw - bw - 10 * S, y + (chh - 38 * S) / 2, bw, 38 * S,
+      maxed ? '已满级' : '购买 ' + fmt$(cost), null, afford, afford);
+  });
+  pill('shopnext', cx - 92 * S, P.y + h - 58 * S, 184 * S, 44 * S, '跳过购物，直接下一关 ▶', null, true, true);
+}
+
+// ---------------- 暂停 / 结算 ----------------
+function drawPause() {
+  dim(0.5);
+  const w = Math.min(360 * S, W - 30), h = 190 * S;
+  const P = panel(w, h);
+  const cx = P.x + w / 2;
+  txt('暂 停', cx, P.y + 42 * S, 26 * S, '#4e342e', 'center', 800);
+  pill('resume', cx - 70 * S, P.y + 76 * S, 140 * S, 40 * S, '继续（空格）', null, true, true);
+  pill('menu', cx - 70 * S, P.y + 126 * S, 140 * S, 36 * S, '退出本局', null, true, false);
+}
+function drawEnd(win) {
+  dim(0.5);
+  const w = Math.min(430 * S, W - 24), h = 306 * S;
+  const P = panel(w, h);
+  const cx = P.x + w / 2;
+  txt(win ? '满载而归！' : '时间到，未达标…', cx, P.y + 44 * S, 27 * S, win ? '#2e7d32' : '#b3402f', 'center', 800);
+  txt(win ? '五关全部通过，金矿告罄' : '差 ' + fmt$(targetFor(G.level) - G.money) + ' 达成第 ' + G.level + ' 关目标',
+    cx, P.y + 76 * S, 13.5 * S, '#7a6a4f');
+  const rows = [
+    ['到达关卡', '第 ' + G.level + ' / ' + MAXLV + ' 关'],
+    ['最终持有', fmt$(G.money)],
+    ['本局累计所得', fmt$(G.earned)],
+    ['难度最佳纪录', fmt$(BEST[G.diff] || 0)],
+  ];
+  rows.forEach((r, i) => {
+    const y = P.y + 110 * S + i * 30 * S;
+    txt(r[0], P.x + 30 * S, y, 13.5 * S, '#7a6a4f', 'left');
+    txt(r[1], P.x + w - 30 * S, y, 14 * S, '#4e342e', 'right', 800);
+  });
+  if (G.newBest) {
+    ctx.globalAlpha = 0.75 + 0.25 * Math.sin(G.anim * 6);
+    txt('★ 新纪录！', cx, P.y + 232 * S, 17 * S, '#ff6f00', 'center', 800);
+    ctx.globalAlpha = 1;
+  }
+  pill('again', cx - 150 * S, P.y + 256 * S, 144 * S, 40 * S, '再来一局', null, true, true);
+  pill('menu', cx + 6 * S, P.y + 256 * S, 144 * S, 40 * S, '返回菜单', null, true, false);
+}
+
+// ---------------- 主渲染 ----------------
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  HOT = [];
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  if (G.shake > 0) {
+    ctx.translate((Math.random() - 0.5) * 10 * S * G.shake, (Math.random() - 0.5) * 10 * S * G.shake);
+  }
+  if (G.screen === 'menu') {
+    drawMenu();
+  } else {
+    drawWorld();
+    drawHUD();
+    if (G.screen === 'shop') drawShop();
+    else if (G.screen === 'pause') drawPause();
+    else if (G.screen === 'over') drawEnd(false);
+    else if (G.screen === 'win') drawEnd(true);
+  }
+  ctx.restore();
+}
+
+// ---------------- 主循环 ----------------
+let lastFrame = null, acc = 0;
+function frame(t) {
+  requestAnimationFrame(frame);
+  if (lastFrame === null) { lastFrame = t; return; }
+  let dt = Math.min(0.05, (t - lastFrame) / 1000);
+  lastFrame = t;
+  acc += dt;
+  let n = 0;
+  while (acc >= DT && n < 24) { update(DT); acc -= DT; n++; }
+  render();
+}
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  DPR = Math.min(3, window.devicePixelRatio || 1);
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  S = clamp(H / 800, 0.62, 1.35);
+}
+window.addEventListener('resize', resize);
+
+function init() {
+  resize();
+  loadBest();
+  loadDiff();
+}
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
